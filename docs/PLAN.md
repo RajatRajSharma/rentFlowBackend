@@ -29,9 +29,10 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 - ✅ Move design docs into `docs/` (BACKEND.md, README.md)
 - ✅ Write `docs/SETUP.md` (reproducible setup guide)
 - ⏳ Create the feature-package folder structure (`booking/`, `payment/`, … per SETUP.md §5)
-- ⏳ Add `docker-compose.yml` (postgres, redis, rabbitmq)
-- ⏳ Add `.env.example` and convert `application.properties` → `application.yml`
-- ⏳ `docker-compose up -d postgres redis rabbitmq` and `./mvnw spring-boot:run` → `/actuator/health` is `UP`
+- ✅ Add `docker-compose.yml` (postgres, redis, rabbitmq)
+- ✅ Add `.env` + `.env.example`; convert `application.properties` → `application.yml` (native `.env` import)
+- ✅ `docker-compose up -d` and `./mvnw spring-boot:run` → `/actuator/health` is `UP` (db/redis/rabbit all UP)
+- ✅ Bonus: custom `/api/version` endpoint working (proves controller layer)
 
 ### Day 2 — Database foundation & users table
 - ⏳ Write Flyway migration `V1__users.sql` (users table with role check)

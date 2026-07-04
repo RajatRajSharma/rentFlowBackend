@@ -1,0 +1,66 @@
+spring:
+  # Load a local .env file (if present) as config, like Node's dotenv.
+  # `optional:` = don't fail if .env is missing. `[.properties]` = parse KEY=value lines.
+  # Values in .env override the defaults below; .env itself is git-ignored.
+  config:
+    import: optional:file:.env[.properties]
+
+  application:
+    name: rentflow-backend
+
+  # --- PostgreSQL (source of truth) ---
+  # ${VAR:default} = use env var VAR if set, else the default. Dev works out of the
+  # box; prod overrides via environment variables (never commit real secrets).
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/rentflow}
+    username: ${DB_USER:rentflow}
+    password: ${DB_PASSWORD:rentflow}
+
+  jpa:
+    hibernate:
+      ddl-auto: validate      # Flyway owns the schema; Hibernate only validates it
+    open-in-view: false       # avoid lazy-loading DB access in the view layer
+    properties:
+      hibernate:
+        format_sql: true
+
+  # --- Flyway (versioned DB migrations, auto-run on startup) ---
+  flyway:
+    enabled: true
+    baseline-on-migrate: true # tolerate an existing (empty) schema on first run
+
+  # --- Redis (locks, cache, pub/sub) ---
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+  # --- RabbitMQ (async event bus) ---
+  rabbitmq:
+    host: ${RABBIT_HOST:localhost}
+    port: ${RABBIT_PORT:5672}
+    username: ${RABBIT_USER:guest}
+    password: ${RABBIT_PASSWORD:guest}
+
+server:
+  port: 8080
+
+# --- Actuator: expose health + info endpoints ---
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always    # show per-component health (db, redis, rabbit)
+  info:
+    env:
+      enabled: true           # let info.* properties below appear at /actuator/info
+
+# --- Custom app info (served at /actuator/info and our /api/version) ---
+info:
+  app:
+    name: RentFlow Backend
+    version: 0.0.1-SNAPSHOT
+    description: Equipment rental marketplace — backend

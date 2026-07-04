@@ -137,6 +137,11 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<!-- Java on Windows reports the deprecated tz alias "Asia/Calcutta",
+					     which PostgreSQL 16 rejects. Force the modern, valid name. -->
+					<jvmArguments>-Duser.timezone=Asia/Kolkata</jvmArguments>
+				</configuration>
 			</plugin>
 		</plugins>
 	</build>
