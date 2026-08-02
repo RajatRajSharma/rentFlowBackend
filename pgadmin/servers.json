@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "RentFlow (Docker)",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "rentflow",
+      "Username": "rentflow",
+      "SSLMode": "prefer",
+      "Comment": "Host is the docker service name 'postgres' on internal port 5432 (NOT localhost:5433 — that's only for tools running on your host machine)."
+    }
+  }
+}

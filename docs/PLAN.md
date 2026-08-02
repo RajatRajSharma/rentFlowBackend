@@ -13,7 +13,7 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 ## Progress at a glance
 | Week | Theme | Status |
 |------|-------|--------|
-| 1 | Foundations — setup, auth, item CRUD | 🚧 in progress |
+| 1 | Foundations — setup, auth, item CRUD | ✅ done |
 | 2 | Booking engine — concurrency (the heart) | ⏳ |
 | 3 | Payments — correctness (the fintech story) | ⏳ |
 | 4 | Async & realtime — off-thread + live updates | ⏳ |
@@ -33,34 +33,35 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 - ✅ Add `.env` + `.env.example`; convert `application.properties` → `application.yml` (native `.env` import)
 - ✅ `docker-compose up -d` and `./mvnw spring-boot:run` → `/actuator/health` is `UP` (db/redis/rabbit all UP)
 - ✅ Bonus: custom `/api/version` endpoint working (proves controller layer)
+- ✅ Add pgAdmin to docker-compose (web GUI for Postgres at http://localhost:5050)
 
 ### Day 2 — Database foundation & users table
-- ⏳ Write Flyway migration `V1__users.sql` (users table with role check)
-- ⏳ Confirm Flyway runs on startup and creates the table
-- ⏳ Create `User` JPA entity + `Role` enum (USER, ADMIN)
-- ⏳ Create `UserRepository` (Spring Data JPA)
-- ⏳ Add `common/audit` base entity (created/updated timestamps)
+- ✅ Write Flyway migration `V1__users.sql` (users table with role check)
+- ✅ Confirm Flyway runs on startup and creates the table (history shows V1 success)
+- ✅ Create `User` JPA entity + `Role` enum (USER, ADMIN)
+- ✅ Create `UserRepository` (Spring Data JPA — `existsByEmail`, `findByEmail`)
+- ✅ Add `common/audit` base entity (created/updated timestamps)
 
 ### Day 3 — Registration & password hashing
-- ⏳ `AuthController` with `POST /auth/register`
-- ⏳ `UserService` — hash password (BCrypt), save user, reject duplicate email
-- ⏳ Request/response DTOs in `user/dto/` (records)
-- ⏳ Global exception handling (`@ControllerAdvice` + `ApiError` DTO)
-- ⏳ Manual test: register a user, see the row in Postgres
+- ✅ `AuthController` with `POST /auth/register`
+- ✅ `UserService` — hash password (BCrypt), save user, reject duplicate email
+- ✅ Request/response DTOs in `user/dto/` (records)
+- ✅ Global exception handling (`@RestControllerAdvice` + `ApiError` DTO)
+- ✅ Manual test: register → 201, duplicate → 409, invalid → 400, row in Postgres (BCrypt hash)
 
 ### Day 4 — JWT login & security filter
-- ⏳ Add `jjwt` dependency to `pom.xml`
-- ⏳ `JwtService` — mint + verify tokens
-- ⏳ `JwtAuthFilter` — read token → set `SecurityContext`
-- ⏳ `SecurityConfig` — filter chain, public vs protected routes
-- ⏳ `POST /auth/login` → returns a JWT; hit a protected endpoint with it
+- ✅ Add `jjwt` dependency to `pom.xml` (0.12.6)
+- ✅ `JwtService` — mint + verify tokens (HS384, uid/role claims)
+- ✅ `JwtAuthFilter` — read token → set `SecurityContext` (`AuthenticatedUser` principal)
+- ✅ `SecurityConfig` — stateless, public vs protected routes, JWT filter wired in
+- ✅ `POST /auth/login` → returns a JWT; protected endpoints require it (401/403 without)
 
 ### Day 5 — Item CRUD + ownership guard
-- ⏳ `V2__items.sql` migration (items table, owner_id, version)
-- ⏳ `Item` entity + `ItemRepository`
-- ⏳ `ItemService` + `ItemController`: `GET /items`, `POST /items`, `PUT /items/{id}`
-- ⏳ `OwnershipGuard` — edit allowed iff `item.ownerId == currentUser.id`
-- ⏳ Manual end-to-end test: register → login → list item → edit own item → blocked on another's
+- ✅ `V2__items.sql` migration (items table, owner_id FK, version, index)
+- ✅ `Item` entity (`@Version` optimistic lock) + `ItemRepository`
+- ✅ `ItemService` + `ItemController`: `GET /items`, `GET /items/{id}`, `POST /items`, `PUT /items/{id}`
+- ✅ `OwnershipGuard` — edit allowed iff `item.ownerId == currentUser.id`
+- ✅ Manual end-to-end test: register → login → create item → edit own (200) → B edits A's item (403)
 
 ---
 

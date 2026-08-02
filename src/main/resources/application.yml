@@ -45,6 +45,13 @@ spring:
 server:
   port: 8080
 
+# --- App-specific settings ---
+app:
+  jwt:
+    # Secret comes from the JWT_SECRET env var (.env in dev). Must be >= 32 chars.
+    secret: ${JWT_SECRET:dev-local-secret-change-me-0123456789abcdef0123456789abcdef}
+    expiration-ms: 86400000   # 24 hours
+
 # --- Actuator: expose health + info endpoints ---
 management:
   endpoints:

@@ -34,5 +34,25 @@ services:
       - "5672:5672"           # AMQP protocol (the app connects here)
       - "15672:15672"         # management UI: http://localhost:15672 (guest/guest)
 
+  # pgAdmin — a web GUI for Postgres (the "Mongo Atlas" equivalent).
+  # Open http://localhost:5050 — no login (local mode). The RentFlow server is
+  # pre-registered via servers.json; you just enter the DB password (rentflow) on connect.
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: rentflow-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@rentflow.com          # only used to seed the account (.local is rejected)
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'                # desktop mode: skip the login page
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'   # skip the master-password prompt
+    ports:
+      - "5050:80"
+    volumes:
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro # pre-register the RentFlow server
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres
+
 volumes:
   pgdata:
+  pgadmin_data:
