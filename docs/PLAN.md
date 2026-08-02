@@ -14,7 +14,7 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 | Week | Theme | Status |
 |------|-------|--------|
 | 1 | Foundations — setup, auth, item CRUD | ✅ done |
-| 2 | Booking engine — concurrency (the heart) | ⏳ |
+| 2 | Booking engine — concurrency (the heart) | 🚧 days 6–7 done |
 | 3 | Payments — correctness (the fintech story) | ⏳ |
 | 4 | Async & realtime — off-thread + live updates | ⏳ |
 | 5 | Analytics, docs & production | ⏳ |
@@ -69,22 +69,28 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 **Goal:** no double-booking under concurrent load, proven by a test.
 
 ### Day 6 — Booking entity & state machine
-- ⏳ `V3__bookings_and_exclusion.sql` (bookings table + availability index)
-- ⏳ `Booking` entity + `BookingStatus` enum + `@Version` column
-- ⏳ `BookingStateMachine` — legal-transition table, reject illegal jumps
-- ⏳ Unit tests for the state machine transitions
+- ✅ `V3__bookings_and_exclusion.sql` (bookings table + availability index)
+- ✅ `Booking` entity + `BookingStatus` enum + `@Version` column
+- ✅ `BookingStateMachine` — legal-transition table, reject illegal jumps
+- ✅ Unit tests for the state machine transitions (45 tests, all green)
+- ✅ Bonus: pulled the **exclusion constraint** forward into V3 (see Day 8 note)
 
 ### Day 7 — Availability & overlap query
-- ⏳ `BookingRepository` with the overlap query (`start <= newEnd AND end >= newStart`)
-- ⏳ `GET /items/{id}/availability?from=&to=`
-- ⏳ `BookingService.create()` happy path → writes `PENDING_PAYMENT`
-- ⏳ `POST /bookings` + `GET /bookings/me`
+- ✅ `BookingRepository` with the overlap query (`start <= newEnd AND end >= newStart`)
+- ✅ `GET /items/{id}/availability?from=&to=` (public, returns booked ranges)
+- ✅ `BookingService.create()` happy path → writes `PENDING_PAYMENT`
+- ✅ `POST /bookings` + `GET /bookings/me`
+- ✅ Rules enforced: item must be ACTIVE, can't book your own item, max 90 days,
+  price snapshot at booking time
 
 ### Day 8 — Locking layer
 - ⏳ `LockManager` interface + `RedisLockManager` (Redisson `RLock`)
 - ⏳ Wrap booking creation in the Redis lock on `item:{id}`
 - ⏳ Add `SELECT ... FOR UPDATE` (pessimistic) inside the transaction
-- ⏳ Add the Postgres **exclusion constraint** (btree_gist) to the migration
+- ✅ ~~Add the Postgres **exclusion constraint** (btree_gist) to the migration~~ — done on
+  Day 6 instead. Flyway forbids editing an applied migration, and the constraint belongs
+  with the table it protects. Verified by raw SQL: an overlapping insert that bypasses all
+  application code is still rejected.
 
 ### Day 9 — The concurrency proof
 - ⏳ Testcontainers base class in `test/support/`

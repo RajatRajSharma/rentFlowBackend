@@ -9,7 +9,7 @@ An equipment-rental marketplace backend. Java · Spring Boot · PostgreSQL.
 | | |
 |---|---|
 | **Runs at** | `http://localhost:8080` |
-| **Status** | Week 1 complete — auth + item CRUD are live. Booking, payments, analytics are next. |
+| **Status** | Week 1 done (auth + item CRUD). Week 2 in progress — bookings and the no-overlap guarantee are live; distributed locking is next. |
 | **API reference** | [docs/API_DOCS.md](docs/API_DOCS.md) |
 | **Request flow diagrams** | [docs/API_FLOW.md](docs/API_FLOW.md) |
 | **Full product/system design** | [docs/README.md](docs/README.md) |
@@ -102,11 +102,18 @@ or a real payment processor integration in production mode. See [docs/README.md]
 | Browse items | `GET /items`, `GET /items/{id}` — public |
 | List an item | `POST /items` — authenticated, owner taken from the token |
 | Edit an item | `PUT /items/{id}` — authenticated **and** owner-only |
+| Check availability | `GET /items/{id}/availability?from=&to=` — public |
+| Book an item | `POST /bookings` — overlap-checked, created in `PENDING_PAYMENT` |
+| My bookings | `GET /bookings/me` |
+| No double-booking | Postgres `EXCLUDE USING gist` constraint — the DB itself refuses overlaps |
+| Booking lifecycle | `BookingStateMachine` — one transition table, 45 unit tests |
 | Uniform errors | one `ApiError` JSON shape for 400/401/403/404/409 |
-| Schema migrations | Flyway `V1__users.sql`, `V2__items.sql` |
+| Schema migrations | Flyway `V1__users.sql`, `V2__items.sql`, `V3__bookings_and_exclusion.sql` |
 
-⏳ **Not built yet** — booking engine, payments + ledger, refunds/settlement, async notifications,
-WebSocket live status, GraphQL admin analytics. Roadmap in [docs/PLAN.md](docs/PLAN.md).
+⏳ **Not built yet** — the Redis distributed lock and `SELECT … FOR UPDATE` that make booking
+creation safe under concurrent load (the DB constraint already prevents corrupt data), booking
+cancellation, payments + ledger, refunds/settlement, async notifications, WebSocket live status,
+GraphQL admin analytics. Roadmap in [docs/PLAN.md](docs/PLAN.md).
 
 ---
 

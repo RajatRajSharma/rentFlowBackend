@@ -1,7 +1,7 @@
 # RentFlow Backend — API Reference (API_DOCS.md)
 
 Every HTTP endpoint the backend currently exposes, with request/response shapes, auth rules,
-validation rules, and error cases. Generated from the code as of **Week 1 (auth + item CRUD)**.
+validation rules, and error cases. Generated from the code as of **Week 2 day 7 (bookings)**.
 
 - **Base URL (local):** `http://localhost:8080`
 - **Content type:** `application/json` for all request and response bodies
@@ -20,10 +20,11 @@ validation rules, and error cases. Generated from the code as of **Week 1 (auth 
 4. [System endpoints](#4-system-endpoints)
 5. [Auth endpoints](#5-auth-endpoints)
 6. [Item endpoints](#6-item-endpoints)
-7. [Data models](#7-data-models)
-8. [Status code reference](#8-status-code-reference)
-9. [Quick cURL walkthrough](#9-quick-curl-walkthrough)
-10. [Not implemented yet](#10-not-implemented-yet)
+7. [Booking endpoints](#7-booking-endpoints)
+8. [Data models](#8-data-models)
+9. [Status code reference](#9-status-code-reference)
+10. [Quick cURL walkthrough](#10-quick-curl-walkthrough)
+11. [Not implemented yet](#11-not-implemented-yet)
 
 ---
 
@@ -40,6 +41,9 @@ validation rules, and error cases. Generated from the code as of **Week 1 (auth 
 | 7 | GET | `/items/{id}` | Public | Fetch one listing |
 | 8 | POST | `/items` | **Bearer** | Create a listing (owner = caller) |
 | 9 | PUT | `/items/{id}` | **Bearer + owner** | Update a listing you own |
+| 10 | GET | `/items/{id}/availability` | Public | Are these dates free? |
+| 11 | POST | `/bookings` | **Bearer** | Book an item for a date range |
+| 12 | GET | `/bookings/me` | **Bearer** | My bookings as a renter |
 
 Anything not listed above falls through to `.anyRequest().authenticated()` and returns **403**
 when unauthenticated.
@@ -108,10 +112,15 @@ Every handled exception returns the same body, produced by
 | Exception | HTTP | Thrown when |
 |-----------|------|-------------|
 | `MethodArgumentNotValidException` | 400 | `@Valid` body constraints fail |
+| `MissingServletRequestParameterException` | 400 | A required query param is absent |
+| `MethodArgumentTypeMismatchException` | 400 | A query param can't be parsed, e.g. `?from=xyz` |
+| `InvalidDateRangeException` | 400 | End before start, or a range longer than 90 days |
 | `InvalidCredentialsException` | 401 | Login email not found **or** password mismatch |
-| `ForbiddenException` | 403 | Editing a resource you don't own |
+| `ForbiddenException` | 403 | Editing a resource you don't own, or booking your own item |
 | `NotFoundException` | 404 | Item id doesn't exist |
 | `DuplicateEmailException` | 409 | Registering an already-used email |
+| `BookingConflictException` | 409 | Dates already taken, or the item isn't `ACTIVE` |
+| `IllegalTransitionException` | 409 | A booking status change the state machine forbids |
 
 > Note: Spring Security rejections (no/invalid token on a protected route) are produced by the
 > filter chain *before* the handler runs, so they return Spring's default body, not `ApiError`.
@@ -334,7 +343,136 @@ with an optimistic-lock error rather than silently overwriting the first (lost u
 
 ---
 
-## 7. Data models
+## 7. Booking endpoints
+
+Controllers: [BookingController.java](src/main/java/com/rentflow/booking/BookingController.java) and
+[ItemAvailabilityController.java](src/main/java/com/rentflow/booking/ItemAvailabilityController.java).
+
+**Dates are inclusive on both ends.** `2026-09-10` → `2026-09-12` is **three** billable days.
+All dates are ISO `YYYY-MM-DD`.
+
+### 7.1 `GET /items/{id}/availability?from=&to=`
+Public. Are these dates free, and if not, which windows are taken?
+
+| Param | In | Type | Required |
+|-------|----|------|----------|
+| `id` | path | `Long` | yes |
+| `from` | query | ISO date | yes |
+| `to` | query | ISO date | yes |
+
+**200 OK** — free
+```json
+{ "itemId": 2, "from": "2026-09-10", "to": "2026-09-12", "available": true, "bookedRanges": [] }
+```
+
+**200 OK** — partly taken
+```json
+{
+  "itemId": 2,
+  "from": "2026-09-01",
+  "to": "2026-09-30",
+  "available": false,
+  "bookedRanges": [ { "startDate": "2026-09-10", "endDate": "2026-09-12" } ]
+}
+```
+
+`bookedRanges` deliberately omits who booked the dates — this endpoint is public, so a calendar
+can grey out unavailable days without leaking other users' activity.
+
+**Errors**
+| Code | Cause |
+|------|-------|
+| 400 | Missing `from`/`to`, unparseable date, `to` before `from`, or a window over 90 days |
+| 404 | Unknown item id |
+
+Only `PENDING_PAYMENT`, `CONFIRMED` and `ACTIVE` bookings block dates. A `CANCELLED`,
+`PAYMENT_FAILED`, `RETURNED` or `CLOSED` booking releases its dates.
+
+---
+
+### 7.2 `POST /bookings` 🔒
+Create a booking. **Requires a Bearer token.** The renter is taken from the token, and the price is
+computed server-side — a client cannot name its own price.
+
+**Request** (`CreateBookingRequest`)
+```json
+{ "itemId": 2, "startDate": "2026-09-10", "endDate": "2026-09-12" }
+```
+
+| Field | Type | Rules |
+|-------|------|-------|
+| `itemId` | Long | `@NotNull` — "itemId is required" |
+| `startDate` | ISO date | `@NotNull`, `@FutureOrPresent` — "startDate cannot be in the past" |
+| `endDate` | ISO date | `@NotNull`, must not be before `startDate`, max 90 days total |
+
+**201 Created** (`BookingResponse`)
+```json
+{
+  "id": 1,
+  "itemId": 2,
+  "renterId": 4,
+  "startDate": "2026-09-10",
+  "endDate": "2026-09-12",
+  "days": 3,
+  "status": "PENDING_PAYMENT",
+  "totalAmount": 4500.00,
+  "depositAmount": 20000.00
+}
+```
+
+`totalAmount` = `item.dailyRate` × billable days. `depositAmount` is copied from the item. **Both are
+snapshots** — if the owner later edits the item's price, this booking keeps the figures the renter
+agreed to.
+
+Every booking is created in `PENDING_PAYMENT`, which already holds the dates against everyone else.
+Payment (Week 3) is what flips it to `CONFIRMED`.
+
+**Errors**
+| Code | Cause |
+|------|-------|
+| 400 | Validation failed, end before start, or over 90 days |
+| 403 | No/invalid token, **or** you are the item's owner → `You cannot book your own item` |
+| 404 | `Item not found: 999` |
+| 409 | `Item 3 is already booked between 2026-10-12 and 2026-10-18`, or the item isn't `ACTIVE` |
+
+### The no-double-booking guarantee
+Two ranges overlap iff `existing.start <= new.end AND existing.end >= new.start`. That one condition
+covers overlap at the front, at the back, fully inside, and fully surrounding.
+
+Three layers enforce it:
+
+| # | Layer | Status |
+|---|-------|--------|
+| 1 | Overlap query in `BookingService.create` — fast, friendly 409 | ✅ live |
+| 2 | Redis distributed lock + `SELECT … FOR UPDATE` | ⏳ Day 8 |
+| 3 | Postgres `EXCLUDE USING gist` constraint — the DB itself refuses the row | ✅ live |
+
+Layer 1 alone is a check-then-act race under concurrency; layer 2 closes it. Layer 3 is the backstop
+that holds **even if layers 1 and 2 are buggy** — verified by inserting an overlapping row with raw
+SQL, bypassing the application entirely, and watching Postgres reject it. When the constraint fires,
+`saveAndFlush` surfaces it as a `DataIntegrityViolationException` which the service translates into a
+clean 409.
+
+Adjacent bookings are fine: a booking ending the 15th and another starting the 16th both succeed.
+
+---
+
+### 7.3 `GET /bookings/me` 🔒
+Your own bookings as a renter, newest start date first. Returns `[]` for a user who has never
+booked — it never shows bookings made by anyone else.
+
+**200 OK** — array of `BookingResponse` (shape above).
+
+**Errors**
+| Code | Cause |
+|------|-------|
+| 403 | No or invalid token |
+
+> The owner-side view, `GET /items/mine/bookings`, is Day 10 — not built yet.
+
+---
+
+## 8. Data models
 
 ### `UserResponse`
 | Field | Type | Notes |
@@ -362,6 +500,45 @@ with an optimistic-lock error rather than silently overwriting the first (lost u
 | `depositAmount` | BigDecimal | `NUMERIC(12,2)` |
 | `status` | String | `ACTIVE` \| `INACTIVE` (DB check constraint) |
 
+### `BookingResponse`
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | Long | |
+| `itemId` | Long | FK → `items.id` |
+| `renterId` | Long | FK → `users.id`, taken from the token at creation |
+| `startDate` / `endDate` | LocalDate | inclusive both ends |
+| `days` | long | billable days, derived |
+| `status` | enum | see the state machine below |
+| `totalAmount` | BigDecimal | `dailyRate × days`, snapshot |
+| `depositAmount` | BigDecimal | copied from the item, snapshot |
+
+### `AvailabilityResponse`
+| Field | Type | Notes |
+|-------|------|-------|
+| `itemId` | Long | |
+| `from` / `to` | LocalDate | echoes the query |
+| `available` | boolean | true when `bookedRanges` is empty |
+| `bookedRanges` | list | `{startDate, endDate}` — no renter identity |
+
+### `BookingStatus`
+| Status | Meaning | Blocks dates? |
+|--------|---------|---------------|
+| `PENDING_PAYMENT` | created, awaiting payment | ✅ |
+| `CONFIRMED` | paid and reserved | ✅ |
+| `ACTIVE` | renter has the item | ✅ |
+| `RETURNED` | handed back, deposit unsettled | ❌ |
+| `DISPUTED` | damage claimed | ❌ |
+| `CLOSED` | deposit settled — terminal | ❌ |
+| `CANCELLED` | cancelled — terminal | ❌ |
+| `PAYMENT_FAILED` | payment failed/timed out — terminal | ❌ |
+
+Legal transitions live in one place,
+[BookingStateMachine.java](src/main/java/com/rentflow/booking/BookingStateMachine.java); anything
+not in its table is rejected with a 409. The "blocks dates" column must stay in sync with the
+`WHERE` clause of the exclusion constraint in
+[V3__bookings_and_exclusion.sql](src/main/resources/db/migration/V3__bookings_and_exclusion.sql) —
+a unit test asserts they match.
+
 ### `ApiError`
 | Field | Type | Notes |
 |-------|------|-------|
@@ -372,29 +549,31 @@ with an optimistic-lock error rather than silently overwriting the first (lost u
 | `fieldErrors` | Map<String,String> | validation only, else `null` |
 
 ### Underlying tables
-`users` ([V1__users.sql](src/main/resources/db/migration/V1__users.sql)) and
-`items` ([V2__items.sql](src/main/resources/db/migration/V2__items.sql)). Both inherit
-`created_at` / `updated_at` from [Auditable](src/main/java/com/rentflow/common/audit/Auditable.java);
-those columns exist in the DB but are **not** exposed in any response DTO today.
+`users` ([V1__users.sql](src/main/resources/db/migration/V1__users.sql)),
+`items` ([V2__items.sql](src/main/resources/db/migration/V2__items.sql)) and
+`bookings` ([V3__bookings_and_exclusion.sql](src/main/resources/db/migration/V3__bookings_and_exclusion.sql)).
+All three inherit `created_at` / `updated_at` from
+[Auditable](src/main/java/com/rentflow/common/audit/Auditable.java); those columns exist in the DB
+but are **not** exposed in any response DTO today.
 
 ---
 
-## 8. Status code reference
+## 9. Status code reference
 
 | Code | Used for |
 |------|----------|
 | 200 | Successful GET / PUT / login |
-| 201 | `POST /auth/register`, `POST /items` |
-| 400 | Bean-validation failure on a `@Valid` body |
+| 201 | `POST /auth/register`, `POST /items`, `POST /bookings` |
+| 400 | Bean-validation failure, bad query param, or an invalid date range |
 | 401 | Failed login only |
-| 403 | Missing/invalid token on a protected route, or ownership violation |
+| 403 | Missing/invalid token, ownership violation, or booking your own item |
 | 404 | Unknown item id |
-| 409 | Duplicate email at register |
+| 409 | Duplicate email, dates already booked, or an illegal status transition |
 | 503 | `/actuator/health` when a dependency is DOWN |
 
 ---
 
-## 9. Quick cURL walkthrough
+## 10. Quick cURL walkthrough
 
 ```bash
 # 0. Is it alive?
@@ -428,7 +607,25 @@ curl -X PUT http://localhost:8080/items/1 \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"title":"Sony A7 III (updated)","description":"3 batteries","dailyRate":1600.00,"depositAmount":20000.00}'
 
-# 6. Prove the guards work
+# 6. Check availability (public)
+curl "http://localhost:8080/items/1/availability?from=2026-09-10&to=2026-09-12"
+
+# 7. Book it — as a DIFFERENT user, since you can't book your own item
+curl -X POST http://localhost:8080/bookings \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $RENTER_TOKEN" \
+  -d '{"itemId":1,"startDate":"2026-09-10","endDate":"2026-09-12"}'      # → 201, PENDING_PAYMENT
+
+# 8. Same dates again → the overlap guard fires
+curl -X POST http://localhost:8080/bookings \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $RENTER_TOKEN" \
+  -d '{"itemId":1,"startDate":"2026-09-11","endDate":"2026-09-11"}'      # → 409
+
+# 9. My bookings
+curl http://localhost:8080/bookings/me -H "Authorization: Bearer $RENTER_TOKEN"
+
+# 10. Prove the guards work
 curl -X POST http://localhost:8080/items -H "Content-Type: application/json" \
   -d '{"title":"x","dailyRate":1,"depositAmount":0}'                    # → 403, no token
 curl http://localhost:8080/items/9999                                    # → 404
@@ -443,15 +640,19 @@ $TOKEN = (Invoke-RestMethod -Method Post -Uri http://localhost:8080/auth/login `
 
 ---
 
-## 10. Not implemented yet
+## 11. Not implemented yet
 
 Planned in [README.md](docs/README.md) §6 / [PLAN.md](docs/PLAN.md) but **not** in the code today —
 don't expect them to respond:
 
 - `DELETE /items/{id}`, `GET /items/mine`, filtering/pagination on `GET /items`
-- `GET /items/{id}/availability` — already whitelisted as public in `SecurityConfig` in anticipation,
-  but no handler exists, so it currently 404s
-- The whole booking engine (`/bookings/**`), payments (`/payments/**`, webhooks)
+- `POST /bookings/{id}/cancel` and `GET /items/mine/bookings` (the owner's view) — Day 10
+- Nothing yet moves a booking out of `PENDING_PAYMENT`. `BookingStateMachine` knows the legal
+  transitions, but no endpoint calls it — payment (Week 3) is what will.
+- Booking creation is not yet concurrency-safe at the application layer: the Redis lock and
+  `SELECT … FOR UPDATE` land on Day 8. The DB exclusion constraint already prevents corrupt
+  data in the meantime; a race currently surfaces as a 409 rather than a double booking.
+- Payments (`/payments/**`, webhooks), ledger, refunds, settlement
 - GraphQL admin analytics, WebSocket payment-status push
 - Refresh tokens / logout — a token is valid until it expires, there is no revocation
 - `GET /users/me` — the token already carries id/email/role, but nothing serves the profile

@@ -33,18 +33,18 @@ flowchart TD
     F4 -->|"denied"| E403(["403 END"])
     F4 -->|"allowed"| D
 
-    D["DISPATCHER SERVLET<br/>matches METHOD + PATH to a controller method"]
+    D["DISPATCHER SERVLET<br/>matches METHOD + PATH to a controller method<br/>/auth/** · /items/** · /bookings/** · /api/version"]
     B["ARGUMENT BINDING<br/>@RequestBody JSON to DTO<br/>@Valid constraints<br/>@PathVariable<br/>@AuthenticationPrincipal"]
     D --> B
     B -->|"validation fails"| E400(["400 END"])
     B --> CTRL
 
-    CTRL["CONTROLLER - thin<br/>AuthController / ItemController / VersionController"]
-    SVC["SERVICE - fat<br/>UserService / ItemService<br/>@Transactional + business rules"]
-    OG["OwnershipGuard.java"]
-    REPO["REPOSITORY - dumb<br/>UserRepository / ItemRepository<br/>method name becomes SQL"]
-    DB[("POSTGRESQL<br/>users · items")]
-    DTO["Entity to DTO<br/>UserResponse.from / ItemResponse.from"]
+    CTRL["CONTROLLER - thin<br/>Auth / Item / Booking / Availability / Version"]
+    SVC["SERVICE - fat<br/>UserService / ItemService / BookingService<br/>@Transactional + business rules"]
+    OG["OwnershipGuard.java<br/>BookingStateMachine.java"]
+    REPO["REPOSITORY - dumb<br/>User / Item / Booking repositories<br/>method name becomes SQL"]
+    DB[("POSTGRESQL<br/>users · items · bookings")]
+    DTO["Entity to DTO<br/>UserResponse / ItemResponse / BookingResponse"]
     R(["200 / 201 JSON to CLIENT"])
 
     CTRL --> SVC
@@ -79,26 +79,36 @@ flowchart TD
     SC --> AC["AuthController.java"]
     SC --> IC["ItemController.java"]
     SC --> VC["VersionController.java"]
+    SC --> BC["BookingController.java"]
+    SC --> AVC["ItemAvailabilityController.java"]
 
     AC -->|"RegisterRequest<br/>LoginRequest"| US["UserService.java"]
     IC -->|"CreateItemRequest<br/>UpdateItemRequest"| IS["ItemService.java"]
+    BC -->|"CreateBookingRequest"| BS["BookingService.java"]
+    AVC --> BS
 
     US --- PE["PasswordEncoder<br/>BCrypt"]
     AC --- JWT
     IS --> OG["OwnershipGuard.java"]
+    BS -->|"needs rate + owner"| IS
+    BS --- BSM["BookingStateMachine.java"]
 
     US --> UR["UserRepository.java"]
     IS --> IR["ItemRepository.java"]
+    BS --> BR["BookingRepository.java<br/>findOverlapping"]
 
     UR --> UE["User.java<br/>users table"]
     IR --> IE["Item.java<br/>items table"]
+    BR --> BE["Booking.java<br/>bookings table<br/>EXCLUDE constraint"]
 
     UE --> UDTO["UserResponse<br/>AuthResponse"]
     IE --> IDTO["ItemResponse"]
+    BE --> BDTO["BookingResponse<br/>AvailabilityResponse"]
     VC --> VDTO["Map name/version/status"]
 
     UDTO --> OUT
     IDTO --> OUT
+    BDTO --> OUT
     VDTO --> OUT
     OUT(["JSON to CLIENT"])
 
@@ -106,11 +116,15 @@ flowchart TD
     classDef ctrl fill:#e3f0ff,stroke:#3178c6
     classDef svc fill:#efe3ff,stroke:#7a4fbf
     classDef repo fill:#e0f5e0,stroke:#0a0
-    class JAF,JWT,AU,SC,OG,PE sec
-    class AC,IC,VC ctrl
-    class US,IS svc
-    class UR,IR,UE,IE repo
+    class JAF,JWT,AU,SC,OG,PE,BSM sec
+    class AC,IC,VC,BC,AVC ctrl
+    class US,IS,BS svc
+    class UR,IR,BR,UE,IE,BE repo
 ```
+
+Note the dependency direction: `BookingService` uses `ItemService`, never the reverse. That's why
+the availability endpoint lives in the booking package even though its URL starts with `/items` —
+putting it in `ItemController` would create a cycle.
 
 ---
 
@@ -278,6 +292,167 @@ sequenceDiagram
 
 ---
 
+## 6b. GET /items/{id}/availability — public
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CL as Client
+    participant SC as SecurityConfig
+    participant AV as ItemAvailabilityController
+    participant BS as BookingService
+    participant IS as ItemService
+    participant BR as BookingRepository
+
+    CL->>SC: GET /items/2/availability?from=&to=
+    Note over SC: /items/*/availability is public
+    SC->>AV: availability(id, from, to)
+    Note over AV: @DateTimeFormat parses the ISO dates<br/>unparseable or missing param leads to 400
+    AV->>BS: findBlocking(id, from, to)
+
+    alt to before from, or over 90 days
+        BS-->>CL: 400 InvalidDateRangeException
+    else valid range
+        BS->>IS: get(itemId)
+        alt item missing
+            IS-->>CL: 404
+        else exists
+            BS->>BR: findOverlapping(id, BLOCKING, from, to)
+            Note over BR: start <= :to AND end >= :from<br/>status in PENDING_PAYMENT, CONFIRMED, ACTIVE
+            BR-->>BS: blocking bookings
+            BS-->>AV: list
+            AV-->>CL: 200 available + bookedRanges
+        end
+    end
+```
+
+---
+
+## 6c. POST /bookings — the concurrency path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CL as Client
+    participant JF as JwtAuthFilter
+    participant BC as BookingController
+    participant BS as BookingService
+    participant IS as ItemService
+    participant BR as BookingRepository
+    participant DB as PostgreSQL
+
+    CL->>JF: POST /bookings + Bearer token
+    alt no or invalid token
+        JF-->>CL: 403 END
+    else authenticated as uid=4
+        JF->>BC: create(@Valid CreateBookingRequest, principal)
+        Note over BC: renter = token uid, never the body
+        alt validation fails
+            BC-->>CL: 400
+        else valid
+            BC->>BS: create(request, renterId=4)
+            Note over BS: @Transactional
+
+            BS->>BS: requireValidRange(start, end)
+            BS->>IS: get(itemId)
+            Note over BS: item missing leads to 404<br/>item not ACTIVE leads to 409<br/>you own it leads to 403
+
+            BS->>BR: findOverlapping(itemId, BLOCKING, start, end)
+            alt dates taken
+                BR-->>CL: 409 already booked
+            else free
+                Note over BS: DEFENCE GAP until Day 8 —<br/>another request can slip in here
+                BS->>BS: total = dailyRate x days<br/>deposit copied from item
+                BS->>BR: saveAndFlush(booking PENDING_PAYMENT)
+                BR->>DB: INSERT INTO bookings
+                alt EXCLUDE constraint rejects the row
+                    DB-->>BS: DataIntegrityViolationException
+                    BS-->>CL: 409 just booked by someone else
+                else accepted
+                    DB-->>BS: saved
+                    BS-->>BC: Booking
+                    BC-->>CL: 201 BookingResponse
+                end
+            end
+        end
+    end
+```
+
+**Why `saveAndFlush` and not `save`:** `save` only queues the INSERT, so the constraint would fire
+at commit time — outside the method, where the exception can no longer be translated into a clean
+409. Flushing forces the database to check *here*.
+
+---
+
+## 6d. Booking state machine
+
+Legal transitions live in one table in
+[BookingStateMachine.java](src/main/java/com/rentflow/booking/BookingStateMachine.java).
+Anything not drawn below is rejected with a 409.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING_PAYMENT : POST /bookings
+    PENDING_PAYMENT --> CONFIRMED : payment success
+    PENDING_PAYMENT --> PAYMENT_FAILED : fail or timeout
+    PENDING_PAYMENT --> CANCELLED : cancel
+    CONFIRMED --> ACTIVE : start date reached
+    CONFIRMED --> CANCELLED : cancel per rules
+    ACTIVE --> RETURNED : item returned
+    RETURNED --> CLOSED : deposit settled
+    RETURNED --> DISPUTED : damage claimed
+    DISPUTED --> CLOSED : dispute resolved
+    PAYMENT_FAILED --> [*]
+    CANCELLED --> [*]
+    CLOSED --> [*]
+
+    note right of ACTIVE
+        Not cancellable —
+        money and possession
+        have already moved
+    end note
+    note left of PENDING_PAYMENT
+        These three block the calendar:
+        PENDING_PAYMENT, CONFIRMED, ACTIVE.
+        Same list as the DB exclusion constraint.
+    end note
+```
+
+Only `POST /bookings` (the entry arrow) exists today. Every other transition needs payments,
+which is Week 3.
+
+---
+
+## 6e. The three defences against double-booking
+
+```mermaid
+flowchart TD
+    R1["Request A<br/>Oct 10-15"] --> L1
+    R2["Request B<br/>Oct 12-18"] --> L1
+
+    L1["1. Overlap query<br/>BookingService.create"]
+    L2["2. Redis lock on item:id<br/>+ SELECT FOR UPDATE"]
+    L3["3. EXCLUDE USING gist<br/>Postgres refuses the row"]
+
+    L1 -->|"overlap found"| C1(["409 friendly"])
+    L1 -->|"looks free"| L2
+    L2 -->|"loser waits, re-checks"| C2(["409"])
+    L2 -->|"winner proceeds"| L3
+    L3 -->|"conflict"| C3(["409 backstop"])
+    L3 -->|"clean"| OK(["201 booking created"])
+
+    classDef done fill:#e0f5e0,stroke:#0a0
+    classDef todo fill:#f0f0f0,stroke:#999,stroke-dasharray: 4 4
+    class L1,L3 done
+    class L2 todo
+```
+
+Layer 1 and 3 are live. Layer 2 (dashed) is Day 8 — until then layer 1 is a check-then-act race,
+and layer 3 is what actually prevents corrupt data. Verified by inserting an overlapping row with
+raw SQL, bypassing the application entirely: Postgres rejected it.
+
+---
+
 ## 7. Error path
 
 ```mermaid
@@ -321,7 +496,7 @@ flowchart TD
     C --> D["component scan of com.rentflow.**<br/>@RestController @Service @Component @Configuration @Entity"]
     D --> E["beans built + constructor injected<br/>ItemController takes ItemService takes ItemRepository + OwnershipGuard"]
     E --> F["DataSource connects to PostgreSQL<br/>localhost:5433 via docker-compose"]
-    F --> G["Flyway runs V1__users.sql then V2__items.sql<br/>recorded in flyway_schema_history"]
+    F --> G["Flyway runs V1__users.sql, V2__items.sql, V3__bookings_and_exclusion.sql<br/>recorded in flyway_schema_history"]
     G --> H{"Hibernate ddl-auto = validate<br/>entities match real tables?"}
     H -->|no| X(["app fails to start"])
     H -->|yes| I["SecurityFilterChain built<br/>JwtAuthFilter before UsernamePasswordAuthenticationFilter"]
