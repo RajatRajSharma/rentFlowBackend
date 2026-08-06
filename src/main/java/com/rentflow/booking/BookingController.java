@@ -7,6 +7,7 @@ import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -39,5 +40,15 @@ public class BookingController {
     @GetMapping("/me")
     public List<BookingResponse> mine(@AuthenticationPrincipal AuthenticatedUser user) {
         return bookingService.findMine(user.id()).stream().map(BookingResponse::from).toList();
+    }
+
+    /**
+     * Cancel a booking you made. POST rather than DELETE: cancelling is a state change that
+     * keeps the record (we still need it for history, refunds and analytics), not a deletion.
+     */
+    @PostMapping("/{id}/cancel")
+    public BookingResponse cancel(@PathVariable Long id,
+                                  @AuthenticationPrincipal AuthenticatedUser user) {
+        return BookingResponse.from(bookingService.cancel(id, user.id()));
     }
 }

@@ -14,7 +14,7 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 | Week | Theme | Status |
 |------|-------|--------|
 | 1 | Foundations — setup, auth, item CRUD | ✅ done |
-| 2 | Booking engine — concurrency (the heart) | 🚧 days 6–7 done |
+| 2 | Booking engine — concurrency (the heart) | ✅ done |
 | 3 | Payments — correctness (the fintech story) | ⏳ |
 | 4 | Async & realtime — off-thread + live updates | ⏳ |
 | 5 | Analytics, docs & production | ⏳ |
@@ -84,25 +84,34 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
   price snapshot at booking time
 
 ### Day 8 — Locking layer
-- ⏳ `LockManager` interface + `RedisLockManager` (Redisson `RLock`)
-- ⏳ Wrap booking creation in the Redis lock on `item:{id}`
-- ⏳ Add `SELECT ... FOR UPDATE` (pessimistic) inside the transaction
+- ✅ `LockManager` interface + `RedisLockManager` (Redisson `RLock`, wait + lease timeouts)
+- ✅ Wrap booking creation in the Redis lock on `item:{id}` — lock acquired **outside** the
+  transaction and released after commit, via `TransactionTemplate`
+- ✅ Add `SELECT ... FOR UPDATE` (pessimistic) inside the transaction — `ItemRepository
+  .findByIdForUpdate`, `MANDATORY` propagation so it can't be called without one
 - ✅ ~~Add the Postgres **exclusion constraint** (btree_gist) to the migration~~ — done on
   Day 6 instead. Flyway forbids editing an applied migration, and the constraint belongs
   with the table it protects. Verified by raw SQL: an overlapping insert that bypasses all
   application code is still rejected.
 
 ### Day 9 — The concurrency proof
-- ⏳ Testcontainers base class in `test/support/`
-- ⏳ `BookingConcurrencyIT` — fire N (e.g. 500) concurrent requests for one slot
-- ⏳ Assert **exactly 1 succeeds**, the rest rejected, 0 double-bookings
-- ⏳ Capture the result line for the README proof section
+- ✅ Integration-test base class in `test/support/` (Testcontainers, with a docker-compose
+  fallback for machines where Testcontainers can't reach the Docker daemon)
+- ✅ `BookingConcurrencyIT` — 500 concurrent requests for one slot
+- ✅ Asserts **exactly 1 succeeds**, the rest rejected, 1 row in the database
+- ✅ Second test proves the DB defences hold with the Redis lock bypassed entirely
+- ✅ Third test proves locking doesn't reject *legitimate* non-overlapping bookings
+- ✅ Result line captured for the README proof section
 
 ### Day 10 — Cancel + buffer/catch-up
-- ⏳ `POST /bookings/{id}/cancel` (renter, per rules)
-- ⏳ `GET /items/mine/bookings` (owner view)
-- ⏳ Harden error responses + validation
-- ⏳ Catch up / refactor; re-run all tests green
+- ✅ `POST /bookings/{id}/cancel` (renter only, transitions policed by the state machine)
+- ✅ `GET /items/mine/bookings` (owner view)
+- ✅ Harden error responses + validation:
+  - Security rejections now return `ApiError` JSON, and **401** (not 403) when there are no
+    usable credentials — closing the gap noted in API_DOCS
+  - Handlers for malformed JSON, lock contention, optimistic-lock failure, stray
+    integrity violations, and a catch-all so nothing leaks a raw stack trace
+- ✅ All tests green: 46 unit + 3 integration
 
 ---
 

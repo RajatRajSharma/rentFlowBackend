@@ -30,7 +30,7 @@ flowchart TD
         F3x --> F4
     end
 
-    F4 -->|"denied"| E403(["403 END"])
+    F4 -->|"denied - RestAuthEntryPoint"| E403(["401 / 403 END"])
     F4 -->|"allowed"| D
 
     D["DISPATCHER SERVLET<br/>matches METHOD + PATH to a controller method<br/>/auth/** · /items/** · /bookings/** · /api/version"]
@@ -41,7 +41,7 @@ flowchart TD
 
     CTRL["CONTROLLER - thin<br/>Auth / Item / Booking / Availability / Version"]
     SVC["SERVICE - fat<br/>UserService / ItemService / BookingService<br/>@Transactional + business rules"]
-    OG["OwnershipGuard.java<br/>BookingStateMachine.java"]
+    OG["OwnershipGuard.java<br/>BookingStateMachine.java<br/>RedisLockManager.java"]
     REPO["REPOSITORY - dumb<br/>User / Item / Booking repositories<br/>method name becomes SQL"]
     DB[("POSTGRESQL<br/>users · items · bookings")]
     DTO["Entity to DTO<br/>UserResponse / ItemResponse / BookingResponse"]
@@ -80,7 +80,7 @@ flowchart TD
     SC --> IC["ItemController.java"]
     SC --> VC["VersionController.java"]
     SC --> BC["BookingController.java"]
-    SC --> AVC["ItemAvailabilityController.java"]
+    SC --> AVC["ItemBookingController.java"]
 
     AC -->|"RegisterRequest<br/>LoginRequest"| US["UserService.java"]
     IC -->|"CreateItemRequest<br/>UpdateItemRequest"| IS["ItemService.java"]
@@ -90,8 +90,10 @@ flowchart TD
     US --- PE["PasswordEncoder<br/>BCrypt"]
     AC --- JWT
     IS --> OG["OwnershipGuard.java"]
-    BS -->|"needs rate + owner"| IS
+    BS --> OG
+    BS -->|"needs rate + owner<br/>SELECT FOR UPDATE"| IS
     BS --- BSM["BookingStateMachine.java"]
+    BS --- LMG["RedisLockManager.java<br/>lock:item:id"]
 
     US --> UR["UserRepository.java"]
     IS --> IR["ItemRepository.java"]
@@ -116,7 +118,7 @@ flowchart TD
     classDef ctrl fill:#e3f0ff,stroke:#3178c6
     classDef svc fill:#efe3ff,stroke:#7a4fbf
     classDef repo fill:#e0f5e0,stroke:#0a0
-    class JAF,JWT,AU,SC,OG,PE,BSM sec
+    class JAF,JWT,AU,SC,OG,PE,BSM,LMG sec
     class AC,IC,VC,BC,AVC ctrl
     class US,IS,BS svc
     class UR,IR,BR,UE,IE,BE repo
@@ -337,13 +339,15 @@ sequenceDiagram
     participant JF as JwtAuthFilter
     participant BC as BookingController
     participant BS as BookingService
+    participant LM as RedisLockManager
+    participant RD as Redis
     participant IS as ItemService
     participant BR as BookingRepository
     participant DB as PostgreSQL
 
     CL->>JF: POST /bookings + Bearer token
     alt no or invalid token
-        JF-->>CL: 403 END
+        JF-->>CL: 401 END
     else authenticated as uid=4
         JF->>BC: create(@Valid CreateBookingRequest, principal)
         Note over BC: renter = token uid, never the body
@@ -351,32 +355,49 @@ sequenceDiagram
             BC-->>CL: 400
         else valid
             BC->>BS: create(request, renterId=4)
-            Note over BS: @Transactional
+            BS->>BS: requireValidRange — cheap checks before taking a lock
 
-            BS->>BS: requireValidRange(start, end)
-            BS->>IS: get(itemId)
-            Note over BS: item missing leads to 404<br/>item not ACTIVE leads to 409<br/>you own it leads to 403
+            BS->>LM: withLock("item:7")
+            LM->>RD: tryLock wait=3s lease=10s
+            alt lock not acquired in time
+                RD-->>CL: 409 too many concurrent requests, retry
+            else acquired
+                Note over BS,DB: TRANSACTION OPENS INSIDE THE LOCK
 
-            BS->>BR: findOverlapping(itemId, BLOCKING, start, end)
-            alt dates taken
-                BR-->>CL: 409 already booked
-            else free
-                Note over BS: DEFENCE GAP until Day 8 —<br/>another request can slip in here
-                BS->>BS: total = dailyRate x days<br/>deposit copied from item
-                BS->>BR: saveAndFlush(booking PENDING_PAYMENT)
-                BR->>DB: INSERT INTO bookings
-                alt EXCLUDE constraint rejects the row
-                    DB-->>BS: DataIntegrityViolationException
-                    BS-->>CL: 409 just booked by someone else
-                else accepted
-                    DB-->>BS: saved
-                    BS-->>BC: Booking
-                    BC-->>CL: 201 BookingResponse
+                BS->>IS: getForUpdate(itemId)
+                IS->>DB: SELECT ... FOR UPDATE — row lock, defence 2
+                Note over BS: item missing leads to 404<br/>item not ACTIVE leads to 409<br/>you own it leads to 403
+
+                BS->>BR: findOverlapping(itemId, BLOCKING, start, end)
+                alt dates taken
+                    BR-->>CL: 409 already booked
+                else free
+                    BS->>BS: total = dailyRate x days<br/>deposit copied from item
+                    BS->>BR: saveAndFlush(booking PENDING_PAYMENT)
+                    BR->>DB: INSERT INTO bookings
+                    alt EXCLUDE constraint rejects the row — defence 3
+                        DB-->>BS: DataIntegrityViolationException
+                        BS-->>CL: 409 just booked by someone else
+                    else accepted
+                        DB-->>BS: saved
+                    end
                 end
+
+                Note over BS,DB: TRANSACTION COMMITS
+                BS->>LM: unlock — only AFTER the commit
+                LM->>RD: release item:7
+                BS-->>BC: Booking
+                BC-->>CL: 201 BookingResponse
             end
         end
     end
 ```
+
+**The ordering is the whole point.** The lock is taken *outside* the transaction and released
+*after* it commits. `BookingService.create` uses a `TransactionTemplate` instead of
+`@Transactional` precisely so this nesting is visible in the code rather than hidden in an
+annotation. Get it backwards — lock inside the transaction — and the lock is released while the
+commit is still in flight, letting the next writer read stale data and book the same dates.
 
 **Why `saveAndFlush` and not `save`:** `save` only queues the INSERT, so the constraint would fire
 at commit time — outside the method, where the exception can no longer be translated into a clean
@@ -418,8 +439,46 @@ stateDiagram-v2
     end note
 ```
 
-Only `POST /bookings` (the entry arrow) exists today. Every other transition needs payments,
-which is Week 3.
+Two transitions are wired to endpoints today: **create** (`POST /bookings` → `PENDING_PAYMENT`)
+and **cancel** (`POST /bookings/{id}/cancel` → `CANCELLED`). The rest are defined and tested but
+unreachable until payments (Week 3) and the return flow exist.
+
+---
+
+## 6f. POST /bookings/{id}/cancel
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CL as Client
+    participant BC as BookingController
+    participant BS as BookingService
+    participant BR as BookingRepository
+    participant OG as OwnershipGuard
+    participant SM as BookingStateMachine
+
+    CL->>BC: POST /bookings/7/cancel + Bearer token
+    BC->>BS: cancel(7, currentUserId)
+    Note over BS: @Transactional
+    BS->>BR: findById(7)
+    alt not found
+        BR-->>CL: 404
+    else found
+        BS->>OG: requireOwner(booking.renterId, currentUserId)
+        alt not the renter
+            OG-->>CL: 403 You do not own this resource
+        else is the renter
+            BS->>SM: requireTransition(status, CANCELLED)
+            alt illegal from this state
+                SM-->>CL: 409 Cannot move a booking from X to CANCELLED
+            else legal
+                BS->>BR: save(status = CANCELLED)
+                Note over BR: CANCELLED is not in BLOCKING,<br/>so the dates are free again immediately
+                BC-->>CL: 200 BookingResponse
+            end
+        end
+    end
+```
 
 ---
 
@@ -430,26 +489,38 @@ flowchart TD
     R1["Request A<br/>Oct 10-15"] --> L1
     R2["Request B<br/>Oct 12-18"] --> L1
 
-    L1["1. Overlap query<br/>BookingService.create"]
-    L2["2. Redis lock on item:id<br/>+ SELECT FOR UPDATE"]
-    L3["3. EXCLUDE USING gist<br/>Postgres refuses the row"]
+    L1["1. Redis lock on item:id<br/>one writer across ALL instances"]
+    L2["2. SELECT FOR UPDATE on the item row<br/>the database serialises writers too"]
+    L3["3. EXCLUDE USING gist<br/>Postgres refuses to store the row"]
 
-    L1 -->|"overlap found"| C1(["409 friendly"])
-    L1 -->|"looks free"| L2
-    L2 -->|"loser waits, re-checks"| C2(["409"])
-    L2 -->|"winner proceeds"| L3
-    L3 -->|"conflict"| C3(["409 backstop"])
+    L1 -->|"lock busy, wait expired"| C1(["409 retry"])
+    L1 -->|"acquired"| L2
+    L2 -->|"overlap query finds a clash"| C2(["409 already booked"])
+    L2 -->|"dates free"| L3
+    L3 -->|"constraint fires"| C3(["409 backstop"])
     L3 -->|"clean"| OK(["201 booking created"])
 
     classDef done fill:#e0f5e0,stroke:#0a0
-    classDef todo fill:#f0f0f0,stroke:#999,stroke-dasharray: 4 4
-    class L1,L3 done
-    class L2 todo
+    class L1,L2,L3 done
 ```
 
-Layer 1 and 3 are live. Layer 2 (dashed) is Day 8 — until then layer 1 is a check-then-act race,
-and layer 3 is what actually prevents corrupt data. Verified by inserting an overlapping row with
-raw SQL, bypassing the application entirely: Postgres rejected it.
+All three are live. Each alone has a hole — 1 fails if Redis is down, 2 fails if someone forgets
+the transaction, 3 gives a correct but unfriendly error. Together they leave none.
+
+Measured, not assumed —
+[BookingConcurrencyIT](src/test/java/com/rentflow/booking/BookingConcurrencyIT.java) fires 500
+simultaneous requests at one slot:
+
+```
+ requests fired      : 500
+ succeeded           : 1
+ rejected (conflict) : 499
+ unexpected errors   : 0
+ bookings in database: 1
+```
+
+A second test repeats it with layer 1 bypassed entirely and still gets exactly one booking. A third
+proves the locking doesn't reject legitimate non-overlapping bookings.
 
 ---
 
@@ -479,11 +550,18 @@ flowchart TD
     AE --> S409["409 duplicate email"]
 
     FC["REJECTED IN THE FILTER CHAIN<br/>no token / expired token"]
-    FC -->|"happens BEFORE DispatcherServlet"| BYP["never reaches GlobalExceptionHandler<br/>Spring default 403 body, not ApiError"]
+    FC -->|"happens BEFORE DispatcherServlet"| REP["RestAuthEntryPoint<br/>writes the SAME ApiError shape"]
+    REP --> S401b["401 no usable credentials"]
+    REP --> S403b["403 authenticated but denied"]
 
-    classDef gap fill:#ffe0e0,stroke:#c00,color:#900
-    class FC,BYP gap
+    CATCH["anything unexpected"] --> S500["500 logged server-side,<br/>bland message returned"]
+
+    classDef ok fill:#e0f5e0,stroke:#0a0
+    class REP ok
 ```
+
+Every error the API returns has the identical `ApiError` shape, whether it came from a controller,
+a service, or the security filter chain.
 
 ---
 

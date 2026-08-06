@@ -9,7 +9,7 @@ An equipment-rental marketplace backend. Java · Spring Boot · PostgreSQL.
 | | |
 |---|---|
 | **Runs at** | `http://localhost:8080` |
-| **Status** | Week 1 done (auth + item CRUD). Week 2 in progress — bookings and the no-overlap guarantee are live; distributed locking is next. |
+| **Status** | Weeks 1–2 done — auth, item CRUD, and the full booking engine. **500 concurrent requests for one slot produce exactly 1 booking** ([proof](#31-the-concurrency-proof)). Payments next. |
 | **API reference** | [docs/API_DOCS.md](docs/API_DOCS.md) |
 | **Request flow diagrams** | [docs/API_FLOW.md](docs/API_FLOW.md) |
 | **Full product/system design** | [docs/README.md](docs/README.md) |
@@ -103,17 +103,48 @@ or a real payment processor integration in production mode. See [docs/README.md]
 | List an item | `POST /items` — authenticated, owner taken from the token |
 | Edit an item | `PUT /items/{id}` — authenticated **and** owner-only |
 | Check availability | `GET /items/{id}/availability?from=&to=` — public |
-| Book an item | `POST /bookings` — overlap-checked, created in `PENDING_PAYMENT` |
-| My bookings | `GET /bookings/me` |
-| No double-booking | Postgres `EXCLUDE USING gist` constraint — the DB itself refuses overlaps |
-| Booking lifecycle | `BookingStateMachine` — one transition table, 45 unit tests |
-| Uniform errors | one `ApiError` JSON shape for 400/401/403/404/409 |
+| Book an item | `POST /bookings` — Redis lock + row lock + DB constraint, created in `PENDING_PAYMENT` |
+| Cancel a booking | `POST /bookings/{id}/cancel` — renter only, frees the dates immediately |
+| My bookings / my items' bookings | `GET /bookings/me`, `GET /items/mine/bookings` |
+| **No double-booking** | Three layers, proven by a 500-thread test — see below |
+| Booking lifecycle | `BookingStateMachine` — one transition table, illegal jumps rejected centrally |
+| Uniform errors | one `ApiError` JSON shape for every failure, including security rejections |
 | Schema migrations | Flyway `V1__users.sql`, `V2__items.sql`, `V3__bookings_and_exclusion.sql` |
+| Tests | 46 unit + 3 integration (real Postgres + Redis), all green |
 
-⏳ **Not built yet** — the Redis distributed lock and `SELECT … FOR UPDATE` that make booking
-creation safe under concurrent load (the DB constraint already prevents corrupt data), booking
-cancellation, payments + ledger, refunds/settlement, async notifications, WebSocket live status,
-GraphQL admin analytics. Roadmap in [docs/PLAN.md](docs/PLAN.md).
+### 3.1 The concurrency proof
+
+The headline claim of this project, measured rather than asserted.
+[BookingConcurrencyIT](src/test/java/com/rentflow/booking/BookingConcurrencyIT.java) releases 500
+threads at once, all requesting the same item for the same dates:
+
+```
+==================== CONCURRENCY PROOF ====================
+ requests fired      : 500
+ succeeded           : 1
+ rejected (conflict) : 499
+ rejected (lock busy): 0
+ unexpected errors   : 0
+ bookings in database: 1
+===========================================================
+```
+
+Three independent layers produce that result:
+
+| # | Layer | What it stops |
+|---|-------|---------------|
+| 1 | **Redis distributed lock** on `item:{id}` (Redisson `RLock`) | Two requests entering the check at once — across *all* instances, which `synchronized` cannot do |
+| 2 | **`SELECT … FOR UPDATE`** on the item row | The same, at the database, if Redis is down or an instance skips it |
+| 3 | **Postgres `EXCLUDE USING gist`** constraint | Storing an overlapping row *at all*, whatever the application does |
+
+A second test repeats the run with layer 1 bypassed entirely and still gets exactly one booking; a
+third confirms locking doesn't reject *legitimate* non-overlapping bookings. The lock is acquired
+**outside** the transaction and released only after commit — the reverse ordering is the classic bug
+that reintroduces the race.
+
+⏳ **Not built yet** — payments + ledger, refunds/settlement, the return flow, scheduled jobs to
+expire abandoned `PENDING_PAYMENT` bookings and start `CONFIRMED` ones, async notifications,
+WebSocket live status, GraphQL admin analytics. Roadmap in [docs/PLAN.md](docs/PLAN.md).
 
 ---
 
@@ -260,10 +291,11 @@ Every technology here is present because the product **needs** it. If an intervi
 
 | Tech | Used for | Why it's non-negotiable for this product |
 |------|----------|------------------------------------------|
-| **Redis** | distributed lock on booking; caching; pub/sub fan-out | A JVM `synchronized` block only locks **one instance**. The moment you run two, it guarantees nothing. Redis gives a lock that all instances respect — the difference between a toy and a system that survives horizontal scaling. |
+| **Redis** + **Redisson** | distributed lock on booking (`RLock`); caching; pub/sub fan-out | A JVM `synchronized` block only locks **one instance**. The moment you run two, it guarantees nothing. Redis gives a lock that all instances respect — the difference between a toy and a system that survives horizontal scaling. Redisson's `RLock` adds the two timings that matter: a **wait** so callers fail fast under contention, and a **lease** so a crashed instance can't hold an item locked forever. |
 | **RabbitMQ** | async work: emails, invoices, deposit-refund jobs | Sending an email inside the booking transaction makes the user wait on SMTP and lets a mail failure roll back a valid booking. Publishing an event instead keeps the request fast and makes the side-effect retryable, with a dead-letter queue for what still fails. |
 | **WebSocket / STOMP** | live payment-status push | Payment confirmation is asynchronous — it arrives by webhook seconds later. Polling from the browser is wasteful and laggy; a push tells the user "payment confirmed" the instant the webhook lands. |
 | **GraphQL** | admin analytics dashboard only | An analytics dashboard asks wildly varying, deeply nested questions ("revenue by category by month, with top owners"). REST would need a new endpoint per widget or return massively over-fetched payloads. GraphQL lets one endpoint serve them all. **Deliberately not used for the transactional API** — REST's explicit contract and cacheability are worth more there. Using the right tool in the right place is the point. |
+| **Testcontainers** | integration tests against real Postgres + Redis | H2 has no `EXCLUDE USING gist`. The double-booking test would pass against a schema that silently dropped the single most important constraint in the system — a test that can't fail the way production fails is worse than no test. |
 | **Docker Compose** | local infrastructure | One command brings up four services identically on any machine, instead of four manual installs. |
 | **pgAdmin** | DB inspection | Browser GUI for the database during development. Dev-only convenience. |
 | **Spring Actuator** | `/actuator/health`, `/info` | Real liveness/readiness reporting per dependency (db, redis, rabbit) — what a load balancer or Kubernetes probe would consume. |
@@ -277,7 +309,10 @@ Every technology here is present because the product **needs** it. If an intervi
 | **Package by feature, not by layer** | Everything about items lives in `item/`. A change to items touches one folder instead of three. |
 | **`BigDecimal` for all money, `NUMERIC(12,2)` in the DB** | `double`/`float` accumulate binary rounding error. Money is never floating point. |
 | **Owner id read from the token, never from the request body** | There is no field an attacker could tamper with to create or edit something as someone else. |
-| **Central `@RestControllerAdvice`** | Every error returns the same JSON shape, and controllers stay free of `try/catch`. |
+| **Central `@RestControllerAdvice`** | Every error returns the same JSON shape, and controllers stay free of `try/catch`. Security rejections are formatted into the same shape by `RestAuthEntryPoint`, so the filter chain isn't an exception to the rule. |
+| **Distributed lock acquired outside the transaction** | Releasing it inside — while the commit is still in flight — lets the next writer read stale data. `BookingService` uses an explicit `TransactionTemplate` so the nesting is visible rather than hidden in an annotation. |
+| **Explicit state machine for booking status** | Illegal states become unreachable, the rules read as one table, and there's exactly one thing to test and one place to change when the lifecycle grows. |
+| **Prices snapshot onto the booking at creation** | An owner editing their daily rate must never change what an existing renter already agreed to pay. |
 | **Append-only ledger for money** *(upcoming)* | A mutable `balance` column loses history and hides bugs. Append-only entries mean every rupee is traceable and any state is re-derivable. |
 
 ---
@@ -298,13 +333,13 @@ flowchart LR
     end
 
     RP --> PG[("PostgreSQL :5433<br/>source of truth")]
-    SV -.->|"locks · cache"| RD[("Redis :6379")]
+    SV -->|"distributed lock<br/>lock:item:id"| RD[("Redis :6379")]
     SV -.->|"publish events"| MQ[["RabbitMQ :5672"]]
     MQ -.->|"consume"| W["Async workers<br/>email · invoice · refund"]
     APP -.->|"live status push"| CL
 
     classDef soon stroke-dasharray: 4 4
-    class RD,MQ,W soon
+    class MQ,W soon
 ```
 
 Dashed = installed and running, wired in upcoming weeks.
@@ -338,10 +373,14 @@ rentFlowBackend/
     │   ├── security/                           SecurityConfig · JwtAuthFilter · JwtService
     │   │                                       AuthenticatedUser · OwnershipGuard
     │   ├── user/                               AuthController · UserService · User · dto/
-    │   └── item/                               ItemController · ItemService · Item · dto/
+    │   ├── item/                               ItemController · ItemService · Item · dto/
+    │   └── booking/                            the heart — BookingController · BookingService
+    │                                           BookingStateMachine · LockManager
+    │                                           RedisLockManager · Booking · dto/
     └── resources/
-        ├── application.yml                     config: db · redis · rabbit · jwt · actuator
+        ├── application.yml                     config: db · redis · rabbit · jwt · lock · actuator
         └── db/migration/                       V1__users.sql · V2__items.sql
+                                                V3__bookings_and_exclusion.sql
 ```
 
 ---
@@ -356,9 +395,13 @@ docker compose down               # stop everything (data survives in the volume
 docker compose down -v            # stop AND wipe the database volume
 
 ./mvnw spring-boot:run            # run the app (Flyway migrates on startup)
-./mvnw test                       # run all tests
+./mvnw test                       # fast unit tests only (seconds, no Docker)
+./mvnw verify                     # everything, including the concurrency proof
 ./mvnw clean package              # build a runnable jar in target/
 ```
+
+Unit tests (`*Test`) run under surefire; integration tests (`*IT`) run under failsafe in the
+`verify` phase, so day-to-day `mvnw test` stays fast and doesn't need Docker.
 
 On PowerShell substitute `.\mvnw.cmd` for `./mvnw`.
 
@@ -381,7 +424,8 @@ Useful URLs:
 | `Port 5433 already allocated` | Something else holds the port | Change the host side of `5433:5432` in `docker-compose.yml` **and** `DB_URL` |
 | Startup fails with a key-length error | `JWT_SECRET` shorter than 32 chars | Use a longer secret — HMAC-SHA256 needs 256 bits |
 | `Schema validation: missing table` | Flyway didn't run, or the volume holds an old schema | `docker compose down -v` then `docker compose up -d` to start clean |
-| Protected route returns **403**, expected 401 | Missing/expired tokens are rejected in the filter chain, before the exception handler | Expected behaviour today — see [docs/API_DOCS.md](docs/API_DOCS.md) §2 |
+| `mvnw verify` says "Could not find a valid Docker environment" | Some Docker Desktop builds expose an engine proxy that docker-java can't negotiate with, so Testcontainers can't start | Nothing to do — the test base falls back to the running docker-compose services and its own `rentflow_test` database. Just make sure `docker compose up -d` is running. |
+| Integration tests fail to connect at all | Neither Testcontainers nor compose is up | `docker compose up -d`, wait for postgres `healthy` |
 | `curl --version` errors in PowerShell | `curl` is an alias for `Invoke-WebRequest` | Use `curl.exe` |
 | `mvn: command not found` | Maven isn't installed globally | Use the wrapper: `./mvnw` or `.\mvnw.cmd` |
 | Timezone error from PostgreSQL | Windows reports the deprecated `Asia/Calcutta` alias | Already handled — `pom.xml` forces `-Duser.timezone=Asia/Kolkata` |

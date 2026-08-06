@@ -24,9 +24,11 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 public class SecurityConfig {
 
     private final JwtAuthFilter jwtAuthFilter;
+    private final RestAuthEntryPoint restAuthEntryPoint;
 
-    public SecurityConfig(JwtAuthFilter jwtAuthFilter) {
+    public SecurityConfig(JwtAuthFilter jwtAuthFilter, RestAuthEntryPoint restAuthEntryPoint) {
         this.jwtAuthFilter = jwtAuthFilter;
+        this.restAuthEntryPoint = restAuthEntryPoint;
     }
 
     @Bean
@@ -41,6 +43,11 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/items", "/items/*", "/items/*/availability").permitAll()
                         // Everything else needs authentication
                         .anyRequest().authenticated())
+                // Return our ApiError JSON for security rejections instead of Spring's default,
+                // and answer 401 (not 403) when there are no usable credentials at all.
+                .exceptionHandling(ex -> ex
+                        .authenticationEntryPoint(restAuthEntryPoint)
+                        .accessDeniedHandler(restAuthEntryPoint))
                 // Read the JWT before the standard auth filter runs.
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
         return http.build();

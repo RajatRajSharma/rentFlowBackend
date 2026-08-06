@@ -38,4 +38,18 @@ public interface BookingRepository extends JpaRepository<Booking, Long> {
 
     /** A renter's own bookings, newest trip first. Backs GET /bookings/me. */
     List<Booking> findByRenterIdOrderByStartDateDesc(Long renterId);
+
+    /**
+     * Bookings placed on items owned by this user. Backs GET /items/mine/bookings.
+     *
+     * A subquery rather than a JPA association: Booking stores a plain {@code itemId}, not an
+     * {@code @ManyToOne Item}. Keeping the entities decoupled means the booking feature can't
+     * accidentally lazy-load half the item graph, and one query does the job.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            WHERE b.itemId IN (SELECT i.id FROM Item i WHERE i.ownerId = :ownerId)
+            ORDER BY b.startDate DESC
+            """)
+    List<Booking> findByItemOwnerId(@Param("ownerId") Long ownerId);
 }

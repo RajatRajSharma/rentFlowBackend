@@ -28,7 +28,51 @@
 	</scm>
 	<properties>
 		<java.version>17</java.version>
+		<testcontainers.version>1.21.3</testcontainers.version>
+		<!-- Empty by default: Testcontainers auto-detects Docker on Linux/macOS.
+		     Overridden by the windows-docker-desktop profile below. -->
+		<docker.host/>
+		<!-- Current Docker Desktop reports MinAPIVersion 1.40 and rejects the older version
+		     Testcontainers negotiates by default, answering /info with HTTP 400. Pinning a
+		     version at or above the minimum fixes it; 1.41 is supported by Docker 20.10+. -->
+		<docker.api.version>1.41</docker.api.version>
 	</properties>
+
+	<profiles>
+		<!--
+		  Windows + Docker Desktop: Testcontainers probes \\.\pipe\docker_engine, which on
+		  recent Docker Desktop builds is a stub that answers /info with HTTP 400. The real
+		  engine listens on \\.\pipe\dockerDesktopLinuxEngine — the docker CLI follows that
+		  redirect via its context, docker-java does not. Pointing DOCKER_HOST at the real
+		  pipe fixes "Could not find a valid Docker environment".
+
+		  If your Docker exposes a different endpoint, override it:
+		      mvnw verify -Ddocker.host=tcp://localhost:2375
+		-->
+		<profile>
+			<id>windows-docker-desktop</id>
+			<activation>
+				<os><family>windows</family></os>
+			</activation>
+			<properties>
+				<docker.host>npipe:////./pipe/dockerDesktopLinuxEngine</docker.host>
+			</properties>
+		</profile>
+	</profiles>
+
+	<!-- Testcontainers ships its own BOM; Spring Boot 4's parent doesn't manage these
+	     versions, so we import it and keep every testcontainers artifact in lockstep. -->
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>org.testcontainers</groupId>
+				<artifactId>testcontainers-bom</artifactId>
+				<version>${testcontainers.version}</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
 	<dependencies>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
@@ -79,6 +123,15 @@
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>
 			<scope>runtime</scope>
+		</dependency>
+
+		<!-- Redisson: distributed locks on top of Redis (RLock). We use the plain library
+		     and declare the RedissonClient bean ourselves, rather than the Spring Boot
+		     starter, to avoid coupling to the starter's auto-config version matrix. -->
+		<dependency>
+			<groupId>org.redisson</groupId>
+			<artifactId>redisson</artifactId>
+			<version>3.50.0</version>
 		</dependency>
 
 		<!-- JWT (mint + verify tokens). api at compile time; impl + jackson at runtime. -->
@@ -149,6 +202,25 @@
 			<artifactId>spring-boot-starter-websocket-test</artifactId>
 			<scope>test</scope>
 		</dependency>
+
+		<!-- Testcontainers: real Postgres + Redis in Docker for integration tests.
+		     The concurrency proof is worthless against H2 — it has no exclusion
+		     constraints, so it would pass while the real thing was broken. -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-testcontainers</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>postgresql</artifactId>
+			<scope>test</scope>
+		</dependency>
 	</dependencies>
 
 	<build>
@@ -161,6 +233,44 @@
 					     which PostgreSQL 16 rejects. Force the modern, valid name. -->
 					<jvmArguments>-Duser.timezone=Asia/Kolkata</jvmArguments>
 				</configuration>
+			</plugin>
+
+			<!-- Same Asia/Calcutta vs Asia/Kolkata problem as the spring-boot plugin: the
+			     PostgreSQL driver sends the JVM's default zone on connect, and PG 16 rejects
+			     the deprecated alias. Must be an argLine — the JVM caches its default TimeZone
+			     before test code could change it. -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<argLine>-Duser.timezone=Asia/Kolkata</argLine>
+				</configuration>
+			</plugin>
+
+			<!-- Failsafe runs *IT classes in the `verify` phase. Kept separate from surefire
+			     (*Test, run in `test`) so the fast unit tests aren't held hostage by tests
+			     that need Docker: `mvnw test` stays seconds, `mvnw verify` runs everything. -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-failsafe-plugin</artifactId>
+				<configuration>
+					<argLine>-Duser.timezone=Asia/Kolkata</argLine>
+					<environmentVariables>
+						<!-- Empty on Linux/macOS, so Testcontainers auto-detects as usual.
+						     The windows-docker-desktop profile fills it in — see below. -->
+						<DOCKER_HOST>${docker.host}</DOCKER_HOST>
+						<DOCKER_API_VERSION>${docker.api.version}</DOCKER_API_VERSION>
+						<API_VERSION>${docker.api.version}</API_VERSION>
+					</environmentVariables>
+				</configuration>
+				<executions>
+					<execution>
+						<goals>
+							<goal>integration-test</goal>
+							<goal>verify</goal>
+						</goals>
+					</execution>
+				</executions>
 			</plugin>
 		</plugins>
 	</build>

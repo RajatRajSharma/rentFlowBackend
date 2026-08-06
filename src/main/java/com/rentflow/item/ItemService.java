@@ -5,6 +5,7 @@ import com.rentflow.item.dto.CreateItemRequest;
 import com.rentflow.item.dto.UpdateItemRequest;
 import com.rentflow.security.OwnershipGuard;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
@@ -32,6 +33,20 @@ public class ItemService {
     @Transactional(readOnly = true)
     public Item get(Long id) {
         return itemRepository.findById(id)
+                .orElseThrow(() -> new NotFoundException("Item", id));
+    }
+
+    /**
+     * Same as {@link #get}, but takes a row-level write lock (SELECT ... FOR UPDATE) so
+     * concurrent bookings for this item are serialised by the database.
+     *
+     * MANDATORY propagation: a row lock only lives until commit, so calling this without an
+     * enclosing transaction would silently release it immediately. Rather than let that be a
+     * subtle bug, we fail loudly.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Item getForUpdate(Long id) {
+        return itemRepository.findByIdForUpdate(id)
                 .orElseThrow(() -> new NotFoundException("Item", id));
     }
 

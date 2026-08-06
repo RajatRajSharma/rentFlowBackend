@@ -52,6 +52,16 @@ app:
     secret: ${JWT_SECRET:dev-local-secret-change-me-0123456789abcdef0123456789abcdef}
     expiration-ms: 86400000   # 24 hours
 
+  # Redis distributed lock (booking creation). Two different jobs:
+  #   wait-ms  - how long to queue for the lock before giving up with a 409.
+  #              Bounds how long a user waits when an item is in demand.
+  #   lease-ms - how long Redis holds the lock if we never release it, so an
+  #              instance that crashes mid-booking can't lock an item forever.
+  #              Must comfortably exceed the guarded transaction's worst case.
+  lock:
+    wait-ms: ${LOCK_WAIT_MS:3000}
+    lease-ms: ${LOCK_LEASE_MS:10000}
+
 # --- Actuator: expose health + info endpoints ---
 management:
   endpoints:

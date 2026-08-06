@@ -1,7 +1,7 @@
 # RentFlow Backend — API Reference (API_DOCS.md)
 
 Every HTTP endpoint the backend currently exposes, with request/response shapes, auth rules,
-validation rules, and error cases. Generated from the code as of **Week 2 day 7 (bookings)**.
+validation rules, and error cases. Generated from the code as of **Week 2 complete (booking engine)**.
 
 - **Base URL (local):** `http://localhost:8080`
 - **Content type:** `application/json` for all request and response bodies
@@ -44,8 +44,10 @@ validation rules, and error cases. Generated from the code as of **Week 2 day 7 
 | 10 | GET | `/items/{id}/availability` | Public | Are these dates free? |
 | 11 | POST | `/bookings` | **Bearer** | Book an item for a date range |
 | 12 | GET | `/bookings/me` | **Bearer** | My bookings as a renter |
+| 13 | POST | `/bookings/{id}/cancel` | **Bearer + renter** | Cancel a booking you made |
+| 14 | GET | `/items/mine/bookings` | **Bearer** | Bookings on items I own |
 
-Anything not listed above falls through to `.anyRequest().authenticated()` and returns **403**
+Anything not listed above falls through to `.anyRequest().authenticated()` and returns **401**
 when unauthenticated.
 
 ---
@@ -74,9 +76,16 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9....
 Signed with HMAC-SHA using `app.jwt.secret` (env `JWT_SECRET`, must be ≥ 32 chars).
 
 **Behaviour on a bad token:** [JwtAuthFilter](src/main/java/com/rentflow/security/JwtAuthFilter.java)
-never throws. A missing, malformed, or expired token simply leaves the request *unauthenticated* —
-so a protected route answers **403** (Spring Security's default for an anonymous denial), not 401.
-The only 401 in the app today comes from a failed login.
+never throws. A missing, malformed, or expired token simply leaves the request *unauthenticated*;
+[RestAuthEntryPoint](src/main/java/com/rentflow/security/RestAuthEntryPoint.java) then answers
+**401** with the standard `ApiError` body.
+
+The split is the standard one:
+
+| Code | Means |
+|------|-------|
+| **401** Unauthorized | "I don't know who you are" — no token, malformed, or expired |
+| **403** Forbidden | "I know who you are, and you still may not" — ownership violations |
 
 ### Two layers of authorization
 | Layer | Question | Where |
@@ -114,16 +123,23 @@ Every handled exception returns the same body, produced by
 | `MethodArgumentNotValidException` | 400 | `@Valid` body constraints fail |
 | `MissingServletRequestParameterException` | 400 | A required query param is absent |
 | `MethodArgumentTypeMismatchException` | 400 | A query param can't be parsed, e.g. `?from=xyz` |
+| `HttpMessageNotReadableException` | 400 | Malformed or missing JSON body |
 | `InvalidDateRangeException` | 400 | End before start, or a range longer than 90 days |
 | `InvalidCredentialsException` | 401 | Login email not found **or** password mismatch |
-| `ForbiddenException` | 403 | Editing a resource you don't own, or booking your own item |
-| `NotFoundException` | 404 | Item id doesn't exist |
+| *(security filter chain)* | 401 | No, malformed or expired token on a protected route |
+| `ForbiddenException` | 403 | Acting on a resource you don't own, or booking your own item |
+| `NotFoundException` | 404 | Item or booking id doesn't exist |
 | `DuplicateEmailException` | 409 | Registering an already-used email |
 | `BookingConflictException` | 409 | Dates already taken, or the item isn't `ACTIVE` |
 | `IllegalTransitionException` | 409 | A booking status change the state machine forbids |
+| `LockAcquisitionException` | 409 | Item under heavy contention; the lock timed out — retry |
+| `ObjectOptimisticLockingFailureException` | 409 | Someone else modified the row first (`@Version`) |
+| `DataIntegrityViolationException` | 409 | Any constraint a service didn't already translate |
+| `Exception` (catch-all) | 500 | Anything unexpected — logged server-side, bland message out |
 
-> Note: Spring Security rejections (no/invalid token on a protected route) are produced by the
-> filter chain *before* the handler runs, so they return Spring's default body, not `ApiError`.
+Security rejections are produced by the filter chain *before* the handler runs, so they're
+formatted separately by `RestAuthEntryPoint` — but into the **same** `ApiError` shape, so every
+error the API returns looks identical regardless of where it came from.
 
 ---
 
@@ -312,7 +328,7 @@ Money is `BigDecimal` end to end (`NUMERIC(12,2)` in Postgres) — never `double
 | Code | Cause |
 |------|-------|
 | 400 | Validation failed |
-| 403 | No token / invalid or expired token |
+| 401 | No token / invalid or expired token |
 
 ---
 
@@ -332,7 +348,8 @@ four are sent every time; this is a PUT (replace), not a PATCH (merge).
 | Code | Cause |
 |------|-------|
 | 400 | Validation failed |
-| 403 | No/invalid token, **or** valid token but you aren't the owner → `You do not own this resource` |
+| 401 | No or invalid token |
+| 403 | Valid token, but you aren't the owner → `You do not own this resource` |
 | 404 | `Item not found: 42` |
 
 Order of checks in `ItemService.update`: **load → 404 if missing → ownership → 403 if not yours → apply**.
@@ -431,7 +448,8 @@ Payment (Week 3) is what flips it to `CONFIRMED`.
 | Code | Cause |
 |------|-------|
 | 400 | Validation failed, end before start, or over 90 days |
-| 403 | No/invalid token, **or** you are the item's owner → `You cannot book your own item` |
+| 401 | No or invalid token |
+| 403 | You are the item's owner → `You cannot book your own item` |
 | 404 | `Item not found: 999` |
 | 409 | `Item 3 is already booked between 2026-10-12 and 2026-10-18`, or the item isn't `ACTIVE` |
 
@@ -441,17 +459,40 @@ covers overlap at the front, at the back, fully inside, and fully surrounding.
 
 Three layers enforce it:
 
-| # | Layer | Status |
-|---|-------|--------|
-| 1 | Overlap query in `BookingService.create` — fast, friendly 409 | ✅ live |
-| 2 | Redis distributed lock + `SELECT … FOR UPDATE` | ⏳ Day 8 |
-| 3 | Postgres `EXCLUDE USING gist` constraint — the DB itself refuses the row | ✅ live |
+| # | Layer | What it stops | Status |
+|---|-------|---------------|--------|
+| 1 | Redis distributed lock on `item:{id}` (Redisson `RLock`) | Two requests entering the check at once, **across all instances** | ✅ live |
+| 2 | `SELECT … FOR UPDATE` on the item row | The same, at the database, if Redis is down or skipped | ✅ live |
+| 3 | Postgres `EXCLUDE USING gist` constraint | Storing an overlapping row **at all**, whatever the app does | ✅ live |
 
-Layer 1 alone is a check-then-act race under concurrency; layer 2 closes it. Layer 3 is the backstop
-that holds **even if layers 1 and 2 are buggy** — verified by inserting an overlapping row with raw
-SQL, bypassing the application entirely, and watching Postgres reject it. When the constraint fires,
-`saveAndFlush` surfaces it as a `DataIntegrityViolationException` which the service translates into a
-clean 409.
+Each layer alone has a hole — layer 1 fails if Redis is down, layer 2 fails if someone forgets the
+transaction, layer 3 gives a correct but unfriendly error. Together they leave none.
+
+**Lock ordering matters.** The Redis lock is acquired *outside* the transaction and released only
+after it commits (`BookingService.create` uses a `TransactionTemplate` rather than `@Transactional`
+to make this visible). The classic bug is the reverse: releasing the lock while the transaction is
+still committing lets a second writer read stale data and book the same dates.
+
+`saveAndFlush` — not `save` — forces the constraint to fire inside the service method, where it can
+be translated into a clean 409. A plain `save` defers the INSERT to commit time, outside reach,
+where it surfaces as an opaque 500.
+
+**Proven, not asserted** — see [BookingConcurrencyIT](src/test/java/com/rentflow/booking/BookingConcurrencyIT.java):
+
+```
+==================== CONCURRENCY PROOF ====================
+ requests fired      : 500
+ succeeded           : 1
+ rejected (conflict) : 499
+ rejected (lock busy): 0
+ unexpected errors   : 0
+ bookings in database: 1
+===========================================================
+```
+
+A second test repeats it with the Redis lock bypassed entirely and still gets exactly one booking,
+proving layers 2 and 3 hold on their own. A third confirms locking doesn't reject *legitimate*
+non-overlapping bookings — 20 concurrent requests for 20 distinct days all succeed.
 
 Adjacent bookings are fine: a booking ending the 15th and another starting the 16th both succeed.
 
@@ -466,9 +507,53 @@ booked — it never shows bookings made by anyone else.
 **Errors**
 | Code | Cause |
 |------|-------|
-| 403 | No or invalid token |
+| 401 | No or invalid token |
 
-> The owner-side view, `GET /items/mine/bookings`, is Day 10 — not built yet.
+---
+
+### 7.4 `POST /bookings/{id}/cancel` 🔒 renter-only
+Cancel a booking you made. No request body.
+
+**POST, not DELETE** — cancelling is a state change, not a deletion. The row survives for history,
+refunds and analytics; only its `status` changes.
+
+| Param | In | Type |
+|-------|----|------|
+| `id` | path | `Long` |
+
+**200 OK** — the updated `BookingResponse` with `"status": "CANCELLED"`.
+
+**Errors**
+| Code | Cause |
+|------|-------|
+| 401 | No or invalid token |
+| 403 | You aren't the renter → `You do not own this resource` |
+| 404 | `Booking not found: 999` |
+| 409 | The state machine forbids it, e.g. `Cannot move a booking from CANCELLED to CANCELLED` |
+
+Only `PENDING_PAYMENT` and `CONFIRMED` bookings can be cancelled. Once a booking is `ACTIVE` the
+renter physically has the item — it has to be returned, not cancelled.
+
+**Cancelling frees the dates immediately.** `CANCELLED` isn't in the blocking set, so it drops out
+of both the overlap query and the DB exclusion constraint, and the same range can be rebooked at
+once — including by someone else.
+
+---
+
+### 7.5 `GET /items/mine/bookings` 🔒
+The owner's side of the marketplace: every booking placed on items **you** own, newest start date
+first. The owner id comes from the token, so you can only ever see your own.
+
+**200 OK** — array of `BookingResponse`. `[]` if you own no items, or nobody has booked them.
+
+**Errors**
+| Code | Cause |
+|------|-------|
+| 401 | No or invalid token |
+
+> Note the pairing: `/bookings/me` is your history **as a renter**; `/items/mine/bookings` is your
+> inbound demand **as an owner**. Same account, two roles — which is the whole point of the
+> one-account-type model.
 
 ---
 
@@ -566,7 +651,8 @@ but are **not** exposed in any response DTO today.
 | 201 | `POST /auth/register`, `POST /items`, `POST /bookings` |
 | 400 | Bean-validation failure, bad query param, or an invalid date range |
 | 401 | Failed login only |
-| 403 | Missing/invalid token, ownership violation, or booking your own item |
+| 401 | No, invalid or expired token |
+| 403 | Ownership violation, or booking your own item |
 | 404 | Unknown item id |
 | 409 | Duplicate email, dates already booked, or an illegal status transition |
 | 503 | `/actuator/health` when a dependency is DOWN |
@@ -622,12 +708,19 @@ curl -X POST http://localhost:8080/bookings \
   -H "Authorization: Bearer $RENTER_TOKEN" \
   -d '{"itemId":1,"startDate":"2026-09-11","endDate":"2026-09-11"}'      # → 409
 
-# 9. My bookings
-curl http://localhost:8080/bookings/me -H "Authorization: Bearer $RENTER_TOKEN"
+# 9. My bookings, and the owner's inbound view
+curl http://localhost:8080/bookings/me        -H "Authorization: Bearer $RENTER_TOKEN"
+curl http://localhost:8080/items/mine/bookings -H "Authorization: Bearer $TOKEN"
 
-# 10. Prove the guards work
+# 10. Cancel it — then the same dates are bookable again
+curl -X POST http://localhost:8080/bookings/1/cancel \
+  -H "Authorization: Bearer $RENTER_TOKEN"                              # → 200, CANCELLED
+curl -X POST http://localhost:8080/bookings/1/cancel \
+  -H "Authorization: Bearer $RENTER_TOKEN"                              # → 409, already cancelled
+
+# 11. Prove the guards work
 curl -X POST http://localhost:8080/items -H "Content-Type: application/json" \
-  -d '{"title":"x","dailyRate":1,"depositAmount":0}'                    # → 403, no token
+  -d '{"title":"x","dailyRate":1,"depositAmount":0}'                    # → 401, no token
 curl http://localhost:8080/items/9999                                    # → 404
 ```
 
@@ -646,12 +739,11 @@ Planned in [README.md](docs/README.md) §6 / [PLAN.md](docs/PLAN.md) but **not**
 don't expect them to respond:
 
 - `DELETE /items/{id}`, `GET /items/mine`, filtering/pagination on `GET /items`
-- `POST /bookings/{id}/cancel` and `GET /items/mine/bookings` (the owner's view) — Day 10
-- Nothing yet moves a booking out of `PENDING_PAYMENT`. `BookingStateMachine` knows the legal
-  transitions, but no endpoint calls it — payment (Week 3) is what will.
-- Booking creation is not yet concurrency-safe at the application layer: the Redis lock and
-  `SELECT … FOR UPDATE` land on Day 8. The DB exclusion constraint already prevents corrupt
-  data in the meantime; a race currently surfaces as a 409 rather than a double booking.
+- The only booking transitions wired to an endpoint are *create* (→ `PENDING_PAYMENT`) and
+  *cancel* (→ `CANCELLED`). `BookingStateMachine` knows the rest, but nothing calls them yet —
+  `CONFIRMED` needs payment (Week 3), `ACTIVE`/`RETURNED`/`CLOSED` need the return flow.
+- No scheduled job moves `CONFIRMED → ACTIVE` when a start date arrives, and none expires a
+  stale `PENDING_PAYMENT`, so an abandoned booking holds its dates until someone cancels it.
 - Payments (`/payments/**`, webhooks), ledger, refunds, settlement
 - GraphQL admin analytics, WebSocket payment-status push
 - Refresh tokens / logout — a token is valid until it expires, there is no revocation
