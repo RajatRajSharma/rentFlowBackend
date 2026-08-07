@@ -21,10 +21,11 @@ validation rules, and error cases. Generated from the code as of **Week 2 comple
 5. [Auth endpoints](#5-auth-endpoints)
 6. [Item endpoints](#6-item-endpoints)
 7. [Booking endpoints](#7-booking-endpoints)
-8. [Data models](#8-data-models)
-9. [Status code reference](#9-status-code-reference)
-10. [Quick cURL walkthrough](#10-quick-curl-walkthrough)
-11. [Not implemented yet](#11-not-implemented-yet)
+8. [Payment endpoints](#8-payment-endpoints)
+9. [Data models](#9-data-models)
+10. [Status code reference](#10-status-code-reference)
+11. [Quick cURL walkthrough](#11-quick-curl-walkthrough)
+12. [Not implemented yet](#12-not-implemented-yet)
 
 ---
 
@@ -46,6 +47,8 @@ validation rules, and error cases. Generated from the code as of **Week 2 comple
 | 12 | GET | `/bookings/me` | **Bearer** | My bookings as a renter |
 | 13 | POST | `/bookings/{id}/cancel` | **Bearer + renter** | Cancel a booking you made |
 | 14 | GET | `/items/mine/bookings` | **Bearer** | Bookings on items I own |
+| 15 | POST | `/bookings/{id}/pay` | **Bearer + renter** | Create the payment intents (fee + deposit) |
+| 16 | GET | `/bookings/{id}/payments` | **Bearer + renter** | What has been charged for this booking |
 
 Anything not listed above falls through to `.anyRequest().authenticated()` and returns **401**
 when unauthenticated.
@@ -557,7 +560,119 @@ first. The owner id comes from the token, so you can only ever see your own.
 
 ---
 
-## 8. Data models
+## 8. Payment endpoints
+
+Money endpoints differ from every other endpoint in this API in one way: **a repeated request is
+not a new request.** Everything below is built around that.
+
+### 8.1 `POST /bookings/{id}/pay` 🔒 renter-only
+
+Create (or replay) the payment intents for a booking you rented. **No request body** — the amounts
+come from the booking, so a client can never name its own price, and the renter comes from the JWT.
+
+| Param | In | Type | Notes |
+|-------|----|------|-------|
+| `id` | path | `Long` | Booking id |
+| `Idempotency-Key` | **header** | `String` | **Required.** Non-blank, ≤ 200 chars |
+
+**Why the header is required.** Generating a key server-side would defeat the purpose: a retry
+would generate a different one and charge twice. On a money endpoint, silently accepting that risk
+is not a default worth having — so a missing header is a **400**, not a guess.
+
+**200 OK, not 201** — a retry with the same key is the *same* request and must give the *same*
+answer, so this can't honestly claim to have created something each time.
+
+```json
+{
+  "bookingId": 12,
+  "bookingStatus": "PENDING_PAYMENT",
+  "currency": "INR",
+  "totalCharged": 7000.00,
+  "payments": [
+    {
+      "id": 31, "bookingId": 12, "type": "FEE",
+      "amount": 2000.00, "status": "PENDING",
+      "gatewayRef": "pi_fake_37634a5f4fe098ee",
+      "clientSecret": "pi_fake_37634a5f4fe098ee_secret_9c1d...",
+      "failureReason": null
+    },
+    {
+      "id": 32, "bookingId": 12, "type": "DEPOSIT",
+      "amount": 5000.00, "status": "PENDING",
+      "gatewayRef": "pi_fake_2403a90f30b57c28",
+      "clientSecret": "pi_fake_2403a90f30b57c28_secret_4a70...",
+      "failureReason": null
+    }
+  ]
+}
+```
+
+**Fee and deposit are separate charges, on purpose.** They behave completely differently after this
+point: the fee is *earned* and owed to the owner; the deposit is only *held* and, unless damage is
+claimed, given back. Charging them as one lump sum would make the return settlement impossible to
+reason about — and the renter is entitled to see which is which before paying.
+
+**`status` is always `PENDING` here.** Creating an intent means the gateway agreed to *try*, not
+that money moved. Only the webhook (Day 13) or the reconciliation sweep (Day 18) sets `SUCCEEDED`.
+Nothing in the request path decides its own outcome.
+
+**Errors**
+| Code | Cause |
+|------|-------|
+| 400 | `Missing required header: Idempotency-Key`, or a blank / over-long key |
+| 401 | No or invalid token |
+| 403 | You aren't the renter → `You do not own this resource` |
+| 404 | `Booking not found: 999` |
+| 409 | The booking can no longer be confirmed (cancelled, failed, already returned) |
+| 409 | The booking has no amount to charge |
+| 502 | The payment provider is unavailable — *your booking is unchanged, please retry* |
+
+> **Why 502 and not 500.** Your request was fine; our downstream wasn't. A 500 would blame us and
+> send you off to fix a request with nothing wrong with it; a 4xx would imply there's something for
+> you to correct. 502 says "retry later", which is the only useful thing we can tell you.
+
+### The idempotency guarantee
+
+Three layers, because each alone has a hole — the same shape as the booking engine's
+[no-double-booking guarantee](#the-no-double-booking-guarantee):
+
+| # | Layer | Stops | Fails alone when |
+|---|-------|-------|------------------|
+| 1 | **Replay check** | The ordinary retry, with no lock and no work | Two requests arrive at once and both find nothing |
+| 2 | **Distributed lock** on `pay:{bookingId}` | Concurrent attempts racing each other | Redis is down |
+| 3 | **`payments.idempotency_key` UNIQUE** | A duplicate row, whatever else broke | Never — but it returns an error, not the caller's original result |
+
+Plus a fourth rule that none of the three can express: **a booking has at most one live set of
+charges, whatever key asks for them.** Without it, a renter retrying from a fresh browser tab —
+new key, same booking — would get a second fee and a second deposit, and both could then be paid.
+Key-level idempotency can't catch that: the keys differ, so nothing collides. `FAILED` payments are
+excluded from "live", because a declined card is exactly when a genuinely new attempt *should* be
+allowed.
+
+The key you send is also forwarded to the gateway as its own `Idempotency-Key`, so even a retry
+that gets all the way to Stripe replays the original intent instead of creating a second one.
+
+Proven by `PaymentIdempotencyIT`: **100 simultaneous pay requests → 2 payment rows, ₹7000 charged,
+every caller handed the same two charges.**
+
+### 8.2 `GET /bookings/{id}/payments` 🔒 renter-only
+
+Every payment recorded against a booking, oldest first.
+
+**200 OK** — array of `PaymentResponse`. `clientSecret` is always `null` here: it's a bearer
+credential for one intent, issued by the gateway and never stored, so it is only ever returned by
+the endpoint that just obtained it.
+
+**Errors**
+| Code | Cause |
+|------|-------|
+| 401 | No or invalid token |
+| 403 | You aren't the renter |
+| 404 | `Booking not found: 999` |
+
+---
+
+## 9. Data models
 
 ### `UserResponse`
 | Field | Type | Notes |
@@ -624,6 +739,45 @@ not in its table is rejected with a 409. The "blocks dates" column must stay in 
 [V3__bookings_and_exclusion.sql](src/main/resources/db/migration/V3__bookings_and_exclusion.sql) —
 a unit test asserts they match.
 
+### `PaymentResponse`
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | Long | |
+| `bookingId` | Long | |
+| `type` | `PaymentType` | `FEE` / `DEPOSIT` / `REFUND` |
+| `amount` | BigDecimal | Always > 0 — zero-amount charges are never created |
+| `status` | `PaymentStatus` | `PENDING` / `SUCCEEDED` / `FAILED` |
+| `gatewayRef` | String | The provider's intent id. `null` until the gateway call succeeds |
+| `clientSecret` | String | **Never stored.** Only returned by `POST .../pay`, and only while there's something left to pay |
+| `failureReason` | String | Set on `FAILED`, e.g. `card_declined`; else `null` |
+
+### `PaymentIntentResponse`
+| Field | Type | Notes |
+|-------|------|-------|
+| `bookingId` | Long | |
+| `bookingStatus` | `BookingStatus` | Echoed so a replaying client can see it was confirmed meanwhile |
+| `currency` | String | `INR` by default |
+| `totalCharged` | BigDecimal | Sum of the lines below |
+| `payments` | PaymentResponse[] | Fee first, then deposit |
+
+### `PaymentType`
+| Type | Meaning |
+|------|---------|
+| `FEE` | The rental charge. Earned by the owner once the booking completes |
+| `DEPOSIT` | Refundable damage hold — ours to hold, not ours to keep |
+| `REFUND` | Money going back out (deposit release or partial refund) |
+
+### `PaymentStatus`
+| Status | Meaning |
+|--------|---------|
+| `PENDING` | Intent created; the gateway hasn't told us the outcome |
+| `SUCCEEDED` | The gateway confirmed the money moved |
+| `FAILED` | The gateway declined — see `failureReason` |
+
+> **`PENDING` is not a failure.** A gateway that times out leaves a payment here, and assuming
+> "no answer means no charge" is how real systems end up charging a customer whose booking they
+> also cancelled. Only the gateway gets to say `SUCCEEDED` or `FAILED`.
+
 ### `ApiError`
 | Field | Type | Notes |
 |-------|------|-------|
@@ -635,31 +789,39 @@ a unit test asserts they match.
 
 ### Underlying tables
 `users` ([V1__users.sql](src/main/resources/db/migration/V1__users.sql)),
-`items` ([V2__items.sql](src/main/resources/db/migration/V2__items.sql)) and
-`bookings` ([V3__bookings_and_exclusion.sql](src/main/resources/db/migration/V3__bookings_and_exclusion.sql)).
-All three inherit `created_at` / `updated_at` from
+`items` ([V2__items.sql](src/main/resources/db/migration/V2__items.sql)),
+`bookings` ([V3__bookings_and_exclusion.sql](src/main/resources/db/migration/V3__bookings_and_exclusion.sql)),
+and `payments` + `ledger_entries`
+([V4__payments_ledger.sql](src/main/resources/db/migration/V4__payments_ledger.sql)).
+
+`ledger_entries` has no entity yet — the table is created now so the double-entry ledger (Day 14)
+lands as a service on an existing schema. It is append-only by design: no `updated_at`, no
+`version`, and a DB-level check that every row is either a debit or a credit but never both.
+
+All the rest inherit `created_at` / `updated_at` from
 [Auditable](src/main/java/com/rentflow/common/audit/Auditable.java); those columns exist in the DB
 but are **not** exposed in any response DTO today.
 
 ---
 
-## 9. Status code reference
+## 10. Status code reference
 
 | Code | Used for |
 |------|----------|
-| 200 | Successful GET / PUT / login |
+| 200 | Successful GET / PUT / login, and `POST /bookings/{id}/pay` |
 | 201 | `POST /auth/register`, `POST /items`, `POST /bookings` |
-| 400 | Bean-validation failure, bad query param, or an invalid date range |
+| 400 | Bean-validation failure, bad query param, invalid date range, or a missing/blank `Idempotency-Key` |
 | 401 | Failed login only |
 | 401 | No, invalid or expired token |
 | 403 | Ownership violation, or booking your own item |
 | 404 | Unknown item id |
 | 409 | Duplicate email, dates already booked, or an illegal status transition |
+| 502 | The payment gateway rejected us or never answered |
 | 503 | `/actuator/health` when a dependency is DOWN |
 
 ---
 
-## 10. Quick cURL walkthrough
+## 11. Quick cURL walkthrough
 
 ```bash
 # 0. Is it alive?
@@ -718,7 +880,25 @@ curl -X POST http://localhost:8080/bookings/1/cancel \
 curl -X POST http://localhost:8080/bookings/1/cancel \
   -H "Authorization: Bearer $RENTER_TOKEN"                              # → 409, already cancelled
 
-# 11. Prove the guards work
+# 11. Pay for it — fee + deposit, one idempotency key
+KEY=$(uuidgen)
+curl -X POST http://localhost:8080/bookings/2/pay \
+  -H "Authorization: Bearer $RENTER_TOKEN" \
+  -H "Idempotency-Key: $KEY"                                            # → 200, two PENDING charges
+
+# 12. Send the SAME key again → identical response, still two rows, nothing charged twice
+curl -X POST http://localhost:8080/bookings/2/pay \
+  -H "Authorization: Bearer $RENTER_TOKEN" \
+  -H "Idempotency-Key: $KEY"
+
+# 13. Forget the header → 400, naming what's missing
+curl -X POST http://localhost:8080/bookings/2/pay \
+  -H "Authorization: Bearer $RENTER_TOKEN"                              # → 400
+
+# 14. What has been charged so far
+curl http://localhost:8080/bookings/2/payments -H "Authorization: Bearer $RENTER_TOKEN"
+
+# 15. Prove the guards work
 curl -X POST http://localhost:8080/items -H "Content-Type: application/json" \
   -d '{"title":"x","dailyRate":1,"depositAmount":0}'                    # → 401, no token
 curl http://localhost:8080/items/9999                                    # → 404
@@ -733,7 +913,7 @@ $TOKEN = (Invoke-RestMethod -Method Post -Uri http://localhost:8080/auth/login `
 
 ---
 
-## 11. Not implemented yet
+## 12. Not implemented yet
 
 Planned in [README.md](docs/README.md) §6 / [PLAN.md](docs/PLAN.md) but **not** in the code today —
 don't expect them to respond:
@@ -741,10 +921,16 @@ don't expect them to respond:
 - `DELETE /items/{id}`, `GET /items/mine`, filtering/pagination on `GET /items`
 - The only booking transitions wired to an endpoint are *create* (→ `PENDING_PAYMENT`) and
   *cancel* (→ `CANCELLED`). `BookingStateMachine` knows the rest, but nothing calls them yet —
-  `CONFIRMED` needs payment (Week 3), `ACTIVE`/`RETURNED`/`CLOSED` need the return flow.
+  `ACTIVE`/`RETURNED`/`CLOSED` need the return flow.
+- **Nothing sets a payment to `SUCCEEDED` yet.** `POST /bookings/{id}/pay` creates intents and
+  stops there; the webhook that resolves them is Day 13, so today every payment stays `PENDING`
+  and no booking ever reaches `CONFIRMED` on its own.
 - No scheduled job moves `CONFIRMED → ACTIVE` when a start date arrives, and none expires a
   stale `PENDING_PAYMENT`, so an abandoned booking holds its dates until someone cancels it.
-- Payments (`/payments/**`, webhooks), ledger, refunds, settlement
+- `POST /webhooks/payments` (signature verify + `processed_webhooks` dedupe), the double-entry
+  ledger service, refunds and settlement
+- The default gateway is `fake` — it takes no money. Set `PAYMENT_GATEWAY=stripe` with a
+  `STRIPE_API_KEY` for the real test-mode API.
 - GraphQL admin analytics, WebSocket payment-status push
 - Refresh tokens / logout — a token is valid until it expires, there is no revocation
 - `GET /users/me` — the token already carries id/email/role, but nothing serves the profile

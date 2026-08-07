@@ -15,7 +15,7 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 |------|-------|--------|
 | 1 | Foundations — setup, auth, item CRUD | ✅ done |
 | 2 | Booking engine — concurrency (the heart) | ✅ done |
-| 3 | Payments — correctness (the fintech story) | ⏳ |
+| 3 | Payments — correctness (the fintech story) | 🚧 Days 11–12 done |
 | 4 | Async & realtime — off-thread + live updates | ⏳ |
 | 5 | Analytics, docs & production | ⏳ |
 
@@ -119,15 +119,34 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 **Goal:** money is never lost or double-charged, even on failure/retry.
 
 ### Day 11 — Payment model & gateway abstraction
-- ⏳ `V4__payments_ledger.sql` (payments + ledger_entries tables)
-- ⏳ `Payment` entity (UNIQUE `idempotency_key`) + `PaymentRepository`
-- ⏳ `PaymentGateway` interface + `StripeGateway` impl (test mode)
-- ⏳ Stripe test keys wired via `.env`
+- ✅ `V4__payments_ledger.sql` (payments + ledger_entries tables). `ledger_entries` is created
+  now but has no entity yet — Day 14's service lands on an existing schema. Append-only by
+  design: no `updated_at`, no `version`, and a DB check that every row is a debit **or** a
+  credit, never both
+- ✅ `Payment` entity (UNIQUE `idempotency_key`) + `PaymentRepository` + `PaymentType` /
+  `PaymentStatus` enums
+- ✅ `PaymentGateway` interface + `StripeGateway` (test mode, raw REST via `RestClient` rather
+  than the SDK, so Day 15's WireMock can point at it) + `FakeGateway`
+- ✅ Stripe keys wired via `.env`. `PAYMENT_GATEWAY=fake` is the **default**, so a fresh clone
+  runs end to end with no Stripe account; `stripe` fails fast at startup without a real key
+- ✅ Bonus: moved `LockManager`/`RedisLockManager` to `common/lock/` — payments need it too, and
+  a payment→booking dependency for a generic lock utility is the wrong direction
 
 ### Day 12 — Payment intent + idempotency
-- ⏳ `PaymentService` — create intent (fee + deposit) with idempotency key
-- ⏳ `POST /bookings/{id}/pay` (renter only, idempotency key required)
-- ⏳ `IdempotencyService` — dedupe retried pay requests
+- ✅ `PaymentService` — reserve PENDING rows → call the gateway → record the ref, in that order.
+  Rows are written **before** the gateway call so the key is claimed before money can move
+- ✅ `POST /bookings/{id}/pay` (renter only, `Idempotency-Key` header required → 400 without).
+  Returns **200, not 201** — a retry is the same request and must give the same answer
+- ✅ `GET /bookings/{id}/payments` (renter only)
+- ✅ `IdempotencyService` — fast replay check → distributed lock → re-check under the lock
+- ✅ Plus a rule idempotency keys can't express: a booking has at most **one live set of charges**,
+  whatever key asks for them, so a retry from a fresh tab (new key) can't double-charge
+- ✅ `PaymentIdempotencyIT` — **100 concurrent pay requests → 2 payment rows, ₹7000, 0 failures**
+- ✅ Found and fixed a real race while testing: writing `gateway_ref` via an entity `save()` made
+  concurrent retries fail with optimistic-lock errors, for a write they all agreed on. Now a
+  conditional `UPDATE ... WHERE gateway_ref IS NULL`
+- ✅ 502 (not 500) when the gateway is unreachable; `MissingRequestHeaderException` → 400
+- ✅ All tests green: 46 unit + 11 integration
 
 ### Day 13 — Webhook handler
 - ⏳ `V5__returns_webhooks.sql` (returns + processed_webhooks tables)

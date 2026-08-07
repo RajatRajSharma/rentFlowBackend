@@ -5,6 +5,7 @@ import com.rentflow.common.exception.BookingConflictException;
 import com.rentflow.common.exception.ForbiddenException;
 import com.rentflow.common.exception.InvalidDateRangeException;
 import com.rentflow.common.exception.NotFoundException;
+import com.rentflow.common.lock.LockManager;
 import com.rentflow.item.Item;
 import com.rentflow.item.ItemService;
 import com.rentflow.security.OwnershipGuard;

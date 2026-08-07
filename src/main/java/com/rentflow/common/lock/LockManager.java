@@ -1,4 +1,4 @@
-package com.rentflow.booking;
+package com.rentflow.common.lock;
 
 import java.util.function.Supplier;
 

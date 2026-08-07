@@ -1,5 +1,6 @@
 package com.rentflow.common.exception;
 
+import com.rentflow.payment.gateway.PaymentGatewayException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -8,6 +9,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -68,6 +70,12 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.BAD_REQUEST, ex.getMessage(), null);
     }
 
+    // Semantically bad request that bean validation can't express -> 400
+    @ExceptionHandler(InvalidRequestException.class)
+    public ResponseEntity<ApiError> handleInvalidRequest(InvalidRequestException ex) {
+        return build(HttpStatus.BAD_REQUEST, ex.getMessage(), null);
+    }
+
     // @Valid failures -> 400, with a field -> message map
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiError> handleValidation(MethodArgumentNotValidException ex) {
@@ -81,6 +89,13 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(MissingServletRequestParameterException.class)
     public ResponseEntity<ApiError> handleMissingParam(MissingServletRequestParameterException ex) {
         return build(HttpStatus.BAD_REQUEST, "Missing required parameter: " + ex.getParameterName(), null);
+    }
+
+    // Missing required header, e.g. /pay without Idempotency-Key -> 400, naming the header
+    // so the client knows what to add rather than guessing at a generic "bad request".
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    public ResponseEntity<ApiError> handleMissingHeader(MissingRequestHeaderException ex) {
+        return build(HttpStatus.BAD_REQUEST, "Missing required header: " + ex.getHeaderName(), null);
     }
 
     // Unparseable parameter, e.g. ?from=not-a-date -> 400 instead of a 500
@@ -107,6 +122,21 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> handleOptimisticLock(ObjectOptimisticLockingFailureException ex) {
         return build(HttpStatus.CONFLICT,
                 "That record was modified by someone else — reload it and try again", null);
+    }
+
+    /**
+     * The payment provider rejected us or never answered -> 502 Bad Gateway.
+     *
+     * Not a 500: the client's request was fine, our downstream wasn't, and blaming
+     * ourselves would send them off to fix a request that has nothing wrong with it.
+     * Not a 4xx either: there is nothing for them to correct. 502 says "retry later",
+     * which is the only useful thing we can tell them.
+     */
+    @ExceptionHandler(PaymentGatewayException.class)
+    public ResponseEntity<ApiError> handlePaymentGateway(PaymentGatewayException ex) {
+        log.warn("Payment gateway failure", ex);
+        return build(HttpStatus.BAD_GATEWAY,
+                "The payment provider is unavailable — your booking is unchanged, please retry", null);
     }
 
     // Any constraint the service didn't already translate -> 409 rather than a leaked 500

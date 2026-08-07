@@ -1,4 +1,4 @@
-package com.rentflow.booking;
+package com.rentflow.common.lock;
 
 import com.rentflow.common.exception.LockAcquisitionException;
 import org.redisson.api.RLock;

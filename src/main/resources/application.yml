@@ -62,6 +62,21 @@ app:
     wait-ms: ${LOCK_WAIT_MS:3000}
     lease-ms: ${LOCK_LEASE_MS:10000}
 
+  # Payments. `gateway` picks the PaymentGateway implementation:
+  #   fake   - no keys, no network, deterministic refs. The default, so a fresh clone
+  #            runs end to end with an empty .env.
+  #   stripe - the real test-mode API. Needs STRIPE_API_KEY; fails fast at startup
+  #            without it rather than at the first customer's payment.
+  # base-url is configurable so the Day 15 WireMock tests can stand up a fake Stripe
+  # and exercise the real StripeGateway against it.
+  payment:
+    gateway: ${PAYMENT_GATEWAY:fake}
+    currency: ${PAYMENT_CURRENCY:INR}
+    stripe:
+      base-url: ${STRIPE_BASE_URL:https://api.stripe.com}
+      api-key: ${STRIPE_API_KEY:}
+      webhook-secret: ${STRIPE_WEBHOOK_SECRET:}
+
 # --- Actuator: expose health + info endpoints ---
 management:
   endpoints:

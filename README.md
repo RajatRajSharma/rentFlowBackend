@@ -9,7 +9,7 @@ An equipment-rental marketplace backend. Java · Spring Boot · PostgreSQL.
 | | |
 |---|---|
 | **Runs at** | `http://localhost:8080` |
-| **Status** | Weeks 1–2 done — auth, item CRUD, and the full booking engine. **500 concurrent requests for one slot produce exactly 1 booking** ([proof](#31-the-concurrency-proof)). Payments next. |
+| **Status** | Weeks 1–2 done, Week 3 in progress. **500 concurrent requests for one slot produce exactly 1 booking** ([proof](#31-the-concurrency-proof)), and **100 concurrent pay requests produce exactly 1 set of charges** ([proof](#32-the-idempotency-proof)). Webhooks + ledger next. |
 | **API reference** | [docs/API_DOCS.md](docs/API_DOCS.md) |
 | **Request flow diagrams** | [docs/API_FLOW.md](docs/API_FLOW.md) |
 | **Full product/system design** | [docs/README.md](docs/README.md) |
@@ -108,9 +108,12 @@ or a real payment processor integration in production mode. See [docs/README.md]
 | My bookings / my items' bookings | `GET /bookings/me`, `GET /items/mine/bookings` |
 | **No double-booking** | Three layers, proven by a 500-thread test — see below |
 | Booking lifecycle | `BookingStateMachine` — one transition table, illegal jumps rejected centrally |
+| Pay for a booking | `POST /bookings/{id}/pay` — fee + deposit intents, `Idempotency-Key` required |
+| **No double-charging** | Replay check + distributed lock + `UNIQUE` key, proven by a 100-thread test — see below |
+| Gateway abstraction | `PaymentGateway` with a Stripe (test-mode) and a keyless `FakeGateway` impl |
 | Uniform errors | one `ApiError` JSON shape for every failure, including security rejections |
-| Schema migrations | Flyway `V1__users.sql`, `V2__items.sql`, `V3__bookings_and_exclusion.sql` |
-| Tests | 46 unit + 3 integration (real Postgres + Redis), all green |
+| Schema migrations | Flyway `V1__users.sql`, `V2__items.sql`, `V3__bookings_and_exclusion.sql`, `V4__payments_ledger.sql` |
+| Tests | 46 unit + 11 integration (real Postgres + Redis), all green |
 
 ### 3.1 The concurrency proof
 
@@ -142,9 +145,45 @@ third confirms locking doesn't reject *legitimate* non-overlapping bookings. The
 **outside** the transaction and released only after commit — the reverse ordering is the classic bug
 that reintroduces the race.
 
-⏳ **Not built yet** — payments + ledger, refunds/settlement, the return flow, scheduled jobs to
-expire abandoned `PENDING_PAYMENT` bookings and start `CONFIRMED` ones, async notifications,
-WebSocket live status, GraphQL admin analytics. Roadmap in [docs/PLAN.md](docs/PLAN.md).
+### 3.2 The idempotency proof
+
+The same problem shape as above — two writers, one permitted outcome — but with money instead of
+dates. [PaymentIdempotencyIT](src/test/java/com/rentflow/payment/PaymentIdempotencyIT.java) fires
+100 simultaneous pay requests carrying **one** `Idempotency-Key`:
+
+```
+================= PAYMENT IDEMPOTENCY PROOF =================
+ pay requests fired  : 100
+ responses returned  : 100
+ failures            : 0
+ payment rows in db  : 2
+ distinct payment ids: 2
+ total charged       : 7000.00
+=============================================================
+```
+
+Two rows — one ₹2000 fee, one ₹5000 deposit — and all 100 callers were handed *the same two
+charges*. Again three layers, each covering the others' hole:
+
+| # | Layer | What it stops | Hole when alone |
+|---|-------|---------------|-----------------|
+| 1 | **Replay check** | The ordinary retry, with no lock and no work | Two requests arrive at once and both find nothing |
+| 2 | **Distributed lock** on `pay:{bookingId}` | Concurrent attempts racing each other | Redis is down |
+| 3 | **`UNIQUE(idempotency_key)`** | A duplicate row, whatever else broke | Returns an error, not the caller's original result |
+
+Plus one rule that no idempotency key can express: **a booking has at most one live set of
+charges.** Without it, a renter retrying from a fresh browser tab — new key, same booking — gets a
+second fee and a second deposit, and both can be paid. The keys differ, so nothing collides.
+
+The ordering matters as much as the layers: payment rows are written **before** the gateway is
+called, so the key is claimed in our database before any money can move. Charge-then-write means a
+crash in between takes the customer's money with no record of it.
+
+⏳ **Not built yet** — the payment webhook (nothing sets `SUCCEEDED` yet, so bookings never reach
+`CONFIRMED` on their own), the double-entry ledger, refunds/settlement, the return flow, scheduled
+jobs to expire abandoned `PENDING_PAYMENT` bookings and start `CONFIRMED` ones, async
+notifications, WebSocket live status, GraphQL admin analytics. Roadmap in
+[docs/PLAN.md](docs/PLAN.md).
 
 ---
 
@@ -369,18 +408,21 @@ rentFlowBackend/
 └── src/main/
     ├── java/com/rentflow/
     │   ├── RentflowBackendApplication.java     entry point
-    │   ├── common/                             VersionController · audit · exceptions
+    │   ├── common/                             VersionController · audit · config · exceptions
+    │   │   └── lock/                           LockManager · RedisLockManager (booking + payment)
     │   ├── security/                           SecurityConfig · JwtAuthFilter · JwtService
     │   │                                       AuthenticatedUser · OwnershipGuard
     │   ├── user/                               AuthController · UserService · User · dto/
     │   ├── item/                               ItemController · ItemService · Item · dto/
-    │   └── booking/                            the heart — BookingController · BookingService
-    │                                           BookingStateMachine · LockManager
-    │                                           RedisLockManager · Booking · dto/
+    │   ├── booking/                            the heart — BookingController · BookingService
+    │   │                                       BookingStateMachine · Booking · dto/
+    │   └── payment/                            the money — PaymentService · IdempotencyService
+    │       └── gateway/                        PaymentGateway · StripeGateway · FakeGateway
     └── resources/
-        ├── application.yml                     config: db · redis · rabbit · jwt · lock · actuator
+        ├── application.yml                     config: db · redis · rabbit · jwt · lock · payment
         └── db/migration/                       V1__users.sql · V2__items.sql
                                                 V3__bookings_and_exclusion.sql
+                                                V4__payments_ledger.sql
 ```
 
 ---
@@ -396,7 +438,7 @@ docker compose down -v            # stop AND wipe the database volume
 
 ./mvnw spring-boot:run            # run the app (Flyway migrates on startup)
 ./mvnw test                       # fast unit tests only (seconds, no Docker)
-./mvnw verify                     # everything, including the concurrency proof
+./mvnw verify                     # everything, including the concurrency + idempotency proofs
 ./mvnw clean package              # build a runnable jar in target/
 ```
 

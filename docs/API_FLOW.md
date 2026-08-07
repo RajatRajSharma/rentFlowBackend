@@ -524,6 +524,90 @@ proves the locking doesn't reject legitimate non-overlapping bookings.
 
 ---
 
+## 6g. POST /bookings/{id}/pay — the idempotency path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CL as Client
+    participant PC as BookingPaymentController
+    participant PS as PaymentService
+    participant ID as IdempotencyService
+    participant LM as LockManager
+    participant PR as PaymentRepository
+    participant GW as PaymentGateway
+
+    CL->>PC: POST /bookings/7/pay + Bearer + Idempotency-Key: abc
+    Note over PC: a missing header is a 400 before<br/>any of this runs
+    PC->>PS: pay(7, renterId, "abc")
+    PS->>PS: requireUsableKey("abc")
+    PS->>PR: findById(7) + requireOwner(renterId)
+    Note over PS: validated on EVERY call, replay or not —<br/>a 403 must stay a 403
+
+    PS->>ID: once("pay:7", replay, reserve)
+    ID->>PR: findByIdempotencyKeyIn([b7:abc:FEE, b7:abc:DEPOSIT])
+    alt already exists (the ordinary retry)
+        PR-->>ID: 2 rows
+        Note over ID: fast path — no lock, no work
+    else nothing yet
+        ID->>LM: withLock("idem:pay:7")
+        Note over LM: scope is the BOOKING, so a different<br/>key cannot race past this
+        ID->>PR: replay AGAIN under the lock
+        Note over ID: skipping this re-check is the classic<br/>double-checked-locking bug
+        alt someone else just finished
+            PR-->>ID: 2 rows
+        else still nothing
+            ID->>PS: reserve(booking, "abc")
+            PS->>PS: canTransition(status, CONFIRMED)?
+            Note over PS: gates CREATING charges, not REPLAYING them
+            PS->>PR: any live (non-FAILED) payments for booking 7?
+            alt yes — a different key already created them
+                PR-->>PS: reuse those
+            else no
+                PS->>PR: saveAll(FEE 2000 PENDING, DEPOSIT 5000 PENDING)
+                Note over PR: UNIQUE(idempotency_key) is the<br/>last-resort backstop here
+            end
+        end
+    end
+
+    loop each payment still unsettled
+        PS->>GW: createIntent(sameIdempotencyKey, amount)
+        Note over GW: called on replays too, on purpose:<br/>the gateway dedupes and returns the<br/>original intent + a usable client secret
+        GW-->>PS: pi_xxx + clientSecret
+        PS->>PR: UPDATE gateway_ref WHERE id = ? AND gateway_ref IS NULL
+        Note over PR: a conditional UPDATE, not save():<br/>concurrent retries all hold version 0, so an<br/>entity save would fail every thread but one
+    end
+
+    PC-->>CL: 200 PaymentIntentResponse (fee + deposit, both PENDING)
+```
+
+Note the ordering: the rows are written **before** the gateway is called. That is what makes a
+retry safe — the key is claimed in our database before any money can move, so a duplicate arriving
+mid-flight collides on the UNIQUE constraint instead of starting a second charge. Charge-then-write
+means a crash in between takes the customer's money with no record of it.
+
+The gateway call sits deliberately **outside** any transaction. A network call inside one pins a
+database connection for as long as someone else's outage lasts, which turns a slow gateway into a
+dead application.
+
+And nothing here ever sets `SUCCEEDED`. Creating an intent means the gateway agreed to *try*; the
+webhook (Day 13) is what resolves it.
+
+Measured, not assumed —
+[PaymentIdempotencyIT](src/test/java/com/rentflow/payment/PaymentIdempotencyIT.java) fires 100
+simultaneous pay requests with one key:
+
+```
+ pay requests fired  : 100
+ responses returned  : 100
+ failures            : 0
+ payment rows in db  : 2
+ distinct payment ids: 2
+ total charged       : 7000.00
+```
+
+---
+
 ## 7. Error path
 
 ```mermaid
