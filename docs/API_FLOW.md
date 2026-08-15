@@ -621,6 +621,7 @@ sequenceDiagram
     participant PR as PaymentRepository
     participant LS as LedgerService
     participant BR as BookingRepository
+    participant EP as EventPublisher
 
     GW->>WC: POST /webhooks/payments + Stripe-Signature
     Note over WC: body bound as a RAW String —<br/>the signature covers the exact bytes,<br/>so a re-serialised DTO could never verify
@@ -647,10 +648,13 @@ sequenceDiagram
                         WS->>PR: markSucceeded + flush
                         WS->>LS: post(debit RENTER_CASH, credit OWNER_PAYABLE / DEPOSIT_HELD)
                         Note over LS: validates debits == credits BEFORE saving,<br/>MANDATORY propagation so it can't commit<br/>while the payment update rolls back
+                        WS->>EP: publish(PaymentSucceeded)
+                        Note over EP: queued for afterCommit — a fact<br/>that can still roll back isn't announced
                         WS->>BR: findByIdForUpdate(bookingId)
                         Note over BR: SELECT FOR UPDATE — fee and deposit<br/>events can arrive simultaneously
                         alt every charge cleared
                             WS->>BR: status = CONFIRMED
+                            WS->>EP: publish(BookingConfirmed)
                         else still waiting on one
                             Note over WS: not confirmed — handing over an item<br/>whose deposit never cleared is the bug
                         end
@@ -678,7 +682,14 @@ happened. Claiming in a separate transaction produces the opposite bug: an event
 processed that wasn't.
 
 Proven by [PaymentWebhookIT](src/test/java/com/rentflow/payment/PaymentWebhookIT.java) — a
-redelivered event posts no second movement, and the books balance at 7000 = 7000.
+redelivered event posts no second movement, and the books balance at 7000 = 7000 — and by
+[WebhookIdempotencyIT](src/test/java/com/rentflow/payment/WebhookIdempotencyIT.java), which fires
+8 copies of one event at once (1 processed, 7 duplicates, one ledger movement) and shows that a
+delivery failing halfway leaves the event id free for the retry.
+
+**Events are announced after the commit.** `publish` registers an `afterCommit` callback rather
+than delivering inline, so a rollback never sends "your booking is confirmed" for a booking the
+database didn't keep.
 
 ---
 

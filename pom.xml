@@ -32,23 +32,14 @@
 		<!-- Empty by default: Testcontainers auto-detects Docker on Linux/macOS.
 		     Overridden by the windows-docker-desktop profile below. -->
 		<docker.host/>
-		<!-- Current Docker Desktop reports MinAPIVersion 1.40 and rejects the older version
-		     Testcontainers negotiates by default, answering /info with HTTP 400. Pinning a
-		     version at or above the minimum fixes it; 1.41 is supported by Docker 20.10+. -->
+		<!-- Docker Desktop rejects the older API version Testcontainers negotiates by
+		     default (/info answers HTTP 400). 1.41 is above its minimum. -->
 		<docker.api.version>1.41</docker.api.version>
 	</properties>
 
 	<profiles>
-		<!--
-		  Windows + Docker Desktop: Testcontainers probes \\.\pipe\docker_engine, which on
-		  recent Docker Desktop builds is a stub that answers /info with HTTP 400. The real
-		  engine listens on \\.\pipe\dockerDesktopLinuxEngine — the docker CLI follows that
-		  redirect via its context, docker-java does not. Pointing DOCKER_HOST at the real
-		  pipe fixes "Could not find a valid Docker environment".
-
-		  If your Docker exposes a different endpoint, override it:
-		      mvnw verify -Ddocker.host=tcp://localhost:2375
-		-->
+		<!-- Windows: Testcontainers probes \\.\pipe\docker_engine, but the real engine is on
+		     \\.\pipe\dockerDesktopLinuxEngine. Override with -Ddocker.host=... if yours differs. -->
 		<profile>
 			<id>windows-docker-desktop</id>
 			<activation>
@@ -60,8 +51,7 @@
 		</profile>
 	</profiles>
 
-	<!-- Testcontainers ships its own BOM; Spring Boot 4's parent doesn't manage these
-	     versions, so we import it and keep every testcontainers artifact in lockstep. -->
+	<!-- Boot 4's parent doesn't manage Testcontainers versions; the BOM keeps them in lockstep. -->
 	<dependencyManagement>
 		<dependencies>
 			<dependency>
@@ -125,9 +115,8 @@
 			<scope>runtime</scope>
 		</dependency>
 
-		<!-- Redisson: distributed locks on top of Redis (RLock). We use the plain library
-		     and declare the RedissonClient bean ourselves, rather than the Spring Boot
-		     starter, to avoid coupling to the starter's auto-config version matrix. -->
+		<!-- Redisson: distributed locks on Redis (RLock). Plain library, not the starter —
+		     we declare the RedissonClient bean ourselves. -->
 		<dependency>
 			<groupId>org.redisson</groupId>
 			<artifactId>redisson</artifactId>
@@ -203,9 +192,8 @@
 			<scope>test</scope>
 		</dependency>
 
-		<!-- Testcontainers: real Postgres + Redis in Docker for integration tests.
-		     The concurrency proof is worthless against H2 — it has no exclusion
-		     constraints, so it would pass while the real thing was broken. -->
+		<!-- Testcontainers: real Postgres + Redis. H2 has no exclusion constraints, so the
+		     concurrency proof would pass there while production was broken. -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-testcontainers</artifactId>
@@ -221,6 +209,15 @@
 			<artifactId>postgresql</artifactId>
 			<scope>test</scope>
 		</dependency>
+
+		<!-- WireMock: a fake Stripe over real HTTP, so StripeGateway itself is under test.
+		     `standalone` shades its Jetty, keeping it clear of Boot's own server. -->
+		<dependency>
+			<groupId>org.wiremock</groupId>
+			<artifactId>wiremock-standalone</artifactId>
+			<version>3.13.2</version>
+			<scope>test</scope>
+		</dependency>
 	</dependencies>
 
 	<build>
@@ -229,15 +226,12 @@
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
 				<configuration>
-					<!-- Java on Windows reports the deprecated tz alias "Asia/Calcutta",
-					     which PostgreSQL 16 rejects. Force the modern, valid name. -->
+					<!-- Java on Windows reports "Asia/Calcutta", which PostgreSQL 16 rejects. -->
 					<jvmArguments>-Duser.timezone=Asia/Kolkata</jvmArguments>
 				</configuration>
 			</plugin>
 
-			<!-- Same Asia/Calcutta vs Asia/Kolkata problem as the spring-boot plugin: the
-			     PostgreSQL driver sends the JVM's default zone on connect, and PG 16 rejects
-			     the deprecated alias. Must be an argLine — the JVM caches its default TimeZone
+			<!-- Same timezone fix. Must be an argLine: the JVM caches its default TimeZone
 			     before test code could change it. -->
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
@@ -247,17 +241,16 @@
 				</configuration>
 			</plugin>
 
-			<!-- Failsafe runs *IT classes in the `verify` phase. Kept separate from surefire
-			     (*Test, run in `test`) so the fast unit tests aren't held hostage by tests
-			     that need Docker: `mvnw test` stays seconds, `mvnw verify` runs everything. -->
+			<!-- Failsafe runs *IT (needs Docker) in `verify`; surefire runs *Test in `test`.
+			     Split so `mvnw test` stays seconds long. -->
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-failsafe-plugin</artifactId>
 				<configuration>
 					<argLine>-Duser.timezone=Asia/Kolkata</argLine>
 					<environmentVariables>
-						<!-- Empty on Linux/macOS, so Testcontainers auto-detects as usual.
-						     The windows-docker-desktop profile fills it in — see below. -->
+						<!-- Empty on Linux/macOS (Testcontainers auto-detects); filled by the
+						     windows-docker-desktop profile. -->
 						<DOCKER_HOST>${docker.host}</DOCKER_HOST>
 						<DOCKER_API_VERSION>${docker.api.version}</DOCKER_API_VERSION>
 						<API_VERSION>${docker.api.version}</API_VERSION>

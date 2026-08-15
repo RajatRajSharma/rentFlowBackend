@@ -114,9 +114,11 @@ or a real payment processor integration in production mode. See [docs/README.md]
 | Payment webhooks | `POST /webhooks/payments` — HMAC signature verify, replay window, `processed_webhooks` dedupe |
 | **Duplicate delivery = no-op** | `INSERT … ON CONFLICT DO NOTHING` claims the event id *before* the work, in the same transaction |
 | **Double-entry ledger** | Every movement is two balanced halves; nothing unbalanced can be written |
+| Failure scenarios | Declines, gateway outages and timeouts covered by WireMock tests against the real `StripeGateway` |
+| Domain events | `EventPublisher` + `PaymentSucceeded` / `BookingConfirmed`, delivered only after the transaction commits |
 | Uniform errors | one `ApiError` JSON shape for every failure, including security rejections |
 | Schema migrations | Flyway `V1__users.sql` … `V5__returns_webhooks.sql` |
-| Tests | 55 unit + 18 integration (real Postgres + Redis), all green |
+| Tests | 66 unit + 29 integration (real Postgres + Redis), all green |
 
 ### 3.1 The concurrency proof
 

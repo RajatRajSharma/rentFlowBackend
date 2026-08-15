@@ -1,7 +1,6 @@
 spring:
-  # Load a local .env file (if present) as config, like Node's dotenv.
-  # `optional:` = don't fail if .env is missing. `[.properties]` = parse KEY=value lines.
-  # Values in .env override the defaults below; .env itself is git-ignored.
+  # Load a git-ignored .env (if present) as config, like Node's dotenv. Its values
+  # override the defaults below.
   config:
     import: optional:file:.env[.properties]
 
@@ -9,8 +8,7 @@ spring:
     name: rentflow-backend
 
   # --- PostgreSQL (source of truth) ---
-  # ${VAR:default} = use env var VAR if set, else the default. Dev works out of the
-  # box; prod overrides via environment variables (never commit real secrets).
+  # ${VAR:default} = env var if set, else the default. Prod overrides via env vars.
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5433/rentflow}
     username: ${DB_USER:rentflow}
@@ -52,42 +50,34 @@ app:
     secret: ${JWT_SECRET:dev-local-secret-change-me-0123456789abcdef0123456789abcdef}
     expiration-ms: 86400000   # 24 hours
 
-  # Redis distributed lock (booking creation). Two different jobs:
-  #   wait-ms  - how long to queue for the lock before giving up with a 409.
-  #              Bounds how long a user waits when an item is in demand.
-  #   lease-ms - how long Redis holds the lock if we never release it, so an
-  #              instance that crashes mid-booking can't lock an item forever.
-  #              Must comfortably exceed the guarded transaction's worst case.
+  # Redis lock (booking creation). wait-ms: how long to queue before a 409. lease-ms: how
+  # long Redis holds it if we never release, so a crashed instance can't lock an item forever.
   lock:
     wait-ms: ${LOCK_WAIT_MS:3000}
     lease-ms: ${LOCK_LEASE_MS:10000}
 
-  # Payments. `gateway` picks the PaymentGateway implementation:
-  #   fake   - no keys, no network, deterministic refs. The default, so a fresh clone
-  #            runs end to end with an empty .env.
-  #   stripe - the real test-mode API. Needs STRIPE_API_KEY; fails fast at startup
-  #            without it rather than at the first customer's payment.
-  # base-url is configurable so the Day 15 WireMock tests can stand up a fake Stripe
-  # and exercise the real StripeGateway against it.
+  # Payments. `gateway` picks the implementation: `fake` (no keys, deterministic refs —
+  # the default) or `stripe` (real test-mode API; fails fast without STRIPE_API_KEY).
   payment:
     gateway: ${PAYMENT_GATEWAY:fake}
     currency: ${PAYMENT_CURRENCY:INR}
 
-    # How far a webhook's signed timestamp may be from now, in either direction. The
-    # timestamp is inside the signed payload, so it can't be edited without breaking the
-    # signature — this window is what stops a captured request being replayed forever.
-    # Stripe's own default is 300s; too tight and clock skew starts rejecting real events.
+    # How far a webhook's signed timestamp may be from now, either direction. Bounds how
+    # long a captured delivery stays replayable; Stripe's own default is 300s.
     webhook-tolerance-seconds: ${WEBHOOK_TOLERANCE_SECONDS:300}
 
     stripe:
+      # base-url is configurable so the WireMock tests can point at a fake Stripe.
       base-url: ${STRIPE_BASE_URL:https://api.stripe.com}
       api-key: ${STRIPE_API_KEY:}
       webhook-secret: ${STRIPE_WEBHOOK_SECRET:}
+      # Bounded waits: an unbounded read timeout turns a hung gateway into our outage.
+      connect-timeout-ms: ${STRIPE_CONNECT_TIMEOUT_MS:3000}
+      read-timeout-ms: ${STRIPE_READ_TIMEOUT_MS:10000}
 
     fake:
-      # The fake gateway signs and verifies webhooks exactly as Stripe does, so the
-      # verification path is exercised locally rather than skipped. A dev-only default is
-      # fine precisely because this gateway moves no money.
+      # The fake signs and verifies exactly as Stripe does, so that path is never skipped.
+      # A dev default is safe precisely because this gateway moves no money.
       webhook-secret: ${FAKE_WEBHOOK_SECRET:dev-local-webhook-secret-change-me}
 
 # --- Actuator: expose health + info endpoints ---

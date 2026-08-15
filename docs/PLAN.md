@@ -15,8 +15,8 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 |------|-------|--------|
 | 1 | Foundations — setup, auth, item CRUD | ✅ done |
 | 2 | Booking engine — concurrency (the heart) | ✅ done |
-| 3 | Payments — correctness (the fintech story) | 🚧 Days 11–14 done |
-| 4 | Async & realtime — off-thread + live updates | ⏳ |
+| 3 | Payments — correctness (the fintech story) | ✅ done |
+| 4 | Async & realtime — off-thread + live updates | 🚧 Day 16 done |
 | 5 | Analytics, docs & production | ⏳ |
 
 ---
@@ -189,10 +189,27 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 - ✅ All tests green: 55 unit + 18 integration
 
 ### Day 15 — Failure scenarios + WireMock
-- ⏳ Card declined → clean rollback
-- ⏳ Gateway timeout → don't assume failure
-- ⏳ `WebhookIdempotencyIT` (duplicate webhook)
-- ⏳ WireMock fake-gateway tests (declines, timeouts, duplicates)
+- ✅ `StripeGatewayWireMockTest` — a fake Stripe over real HTTP, so the class under test is
+  `StripeGateway` itself: decline (402), 5xx, hang, malformed 200, and a retry replaying on
+  the same `Idempotency-Key`. Asserts ₹2000.00 leaves as **200000 paise**
+- ✅ **Found a real bug doing it**: Boot 4 binds response bodies with Jackson 3, while
+  `StripeGateway` asked for a Jackson 2 `JsonNode` — every live Stripe call would have failed.
+  Only a test that speaks HTTP could catch it; the fake gateway never does. Now the body is
+  taken as text and parsed with the same mapper the webhook path uses
+- ✅ Connect/read timeouts on the Stripe client. An unbounded read turns someone else's outage
+  into ours: request threads pile up on a socket that will never answer
+- ✅ `PaymentFailureIT` with a `ControllableGateway` — an outage leaves the charges reserved and
+  ref-less, and a retry recovers *those* rows rather than creating a second set
+- ✅ A timeout never marks a payment FAILED. "No answer" means unknown, not declined — only the
+  gateway may settle a payment
+- ✅ Decline → clean rollback: payment FAILED, booking PAYMENT_FAILED, **no ledger entries**, and
+  the dates genuinely free (proven by booking the same item for the same days). A further pay
+  attempt is a 409 and never reaches the gateway
+- ✅ `WebhookIdempotencyIT` — 8 simultaneous copies of one event → 1 PROCESSED, 7 DUPLICATE, one
+  ledger movement; fee and deposit arriving together confirm exactly once
+- ✅ The claim-rollback proof: a delivery that fails halfway leaves `processed_webhooks` empty,
+  so the gateway's retry is honoured instead of being answered "already done"
+- ✅ All tests green: 66 unit + 29 integration
 
 ---
 
@@ -200,9 +217,18 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 **Goal:** slow work is off the request path; status updates are live.
 
 ### Day 16 — Event publishing
-- ⏳ `EventPublisher` interface (+ `InMemoryPublisher` to start)
-- ⏳ Define events (`BookingConfirmed`, `PaymentSucceeded`, `ReturnRecorded`)
-- ⏳ Publish `PaymentSucceeded` on webhook success
+- ✅ `EventPublisher` + `InMemoryPublisher` (logs and retains a bounded window). Day 17 swaps in
+  RabbitMQ behind the same interface, and nothing that publishes has to change
+- ✅ `DomainEvent` sealed over `PaymentSucceeded`, `BookingConfirmed`, `ReturnRecorded` — past
+  tense facts, carrying amounts so a consumer never has to call back into us and race the
+  transaction that produced the event
+- ✅ **Delivery waits for the commit.** Publishing inline would announce facts that can still roll
+  back — "your booking is confirmed" for a booking the database never kept. Registered as an
+  `afterCommit` synchronisation, so a rollback simply never fires it
+- ✅ Published from the webhook handler: `PaymentSucceeded` per cleared charge, `BookingConfirmed`
+  only once every charge is in. A failed payment announces nothing — nothing happened
+- ✅ Tests: rollback publishes nothing (unit), and a duplicate delivery publishes once (IT)
+- ✅ All tests green: 66 unit + 29 integration
 
 ### Day 17 — RabbitMQ + notifications
 - ⏳ `RabbitConfig` (exchanges, queues, bindings) + `RabbitEventPublisher`

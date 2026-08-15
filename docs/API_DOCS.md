@@ -747,12 +747,20 @@ byte, which leaks enough to forge a signature one byte at a time.
 
 1. Payment → `SUCCEEDED`.
 2. A balanced ledger movement is posted (see [§9 `LedgerEntry`](#ledgerentry)).
-3. The booking is confirmed **only once every charge has cleared** — confirming on the fee alone
-   would hand over an item whose damage deposit was never taken.
+3. A `payment.succeeded` event is published.
+4. The booking is confirmed **only once every charge has cleared** — confirming on the fee alone
+   would hand over an item whose damage deposit was never taken — and that publishes
+   `booking.confirmed`.
 
 A failure sets `FAILED` with the decline code, moves the booking to `PAYMENT_FAILED`, and writes
 **no** ledger entries — no money moved. The ledger records what happened, not what was attempted.
 `PAYMENT_FAILED` isn't in the blocking set, so the dates are released with no extra step.
+
+### Events are delivered after the commit
+
+Publishing happens through `EventPublisher`, and delivery is deferred to `afterCommit`. An email
+saying "your booking is confirmed" for a transaction that then rolled back is worse than a late
+email, so a rollback simply never fires it. Day 17 puts RabbitMQ behind the same interface.
 
 ---
 
