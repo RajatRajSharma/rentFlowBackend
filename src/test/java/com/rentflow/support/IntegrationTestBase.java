@@ -1,6 +1,9 @@
 package com.rentflow.support;
 
+import org.junit.jupiter.api.BeforeEach;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -37,6 +40,31 @@ import java.util.TimeZone;
  */
 @SpringBootTest
 public abstract class IntegrationTestBase {
+
+    /**
+     * Wipe every application table before each test.
+     *
+     * Here rather than in each test class on purpose. Tests used to delete the handful of
+     * tables they knew about, in an order they worked out themselves — which quietly broke
+     * the moment `payments` gained a foreign key to `bookings`, because a leftover payment
+     * from one test made another test's `bookings` cleanup fail. Every new table would have
+     * meant editing every test that predates it.
+     *
+     * TRUNCATE ... CASCADE resolves the dependency order itself, so this list needs no
+     * ordering and adding a table means adding one word. RESTART IDENTITY resets the
+     * sequences too, so ids don't creep upward across a run and tests stay reproducible.
+     *
+     * `flyway_schema_history` is deliberately absent: the schema is built once per run and
+     * must survive.
+     */
+    @BeforeEach
+    void wipeDatabase(@Autowired JdbcTemplate jdbcTemplate) {
+        jdbcTemplate.execute("""
+                TRUNCATE TABLE ledger_entries, processed_webhooks, payments, returns,
+                               bookings, items, users
+                RESTART IDENTITY CASCADE
+                """);
+    }
 
     private static final String FALLBACK_HOST = "localhost";
     private static final int FALLBACK_PG_PORT = 5433;      // docker-compose maps 5433:5432

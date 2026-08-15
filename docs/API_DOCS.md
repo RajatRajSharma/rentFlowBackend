@@ -49,6 +49,7 @@ validation rules, and error cases. Generated from the code as of **Week 2 comple
 | 14 | GET | `/items/mine/bookings` | **Bearer** | Bookings on items I own |
 | 15 | POST | `/bookings/{id}/pay` | **Bearer + renter** | Create the payment intents (fee + deposit) |
 | 16 | GET | `/bookings/{id}/payments` | **Bearer + renter** | What has been charged for this booking |
+| 17 | POST | `/webhooks/payments` | **HMAC signature** | Gateway payment callbacks (idempotent) |
 
 Anything not listed above falls through to `.anyRequest().authenticated()` and returns **401**
 when unauthenticated.
@@ -670,6 +671,89 @@ the endpoint that just obtained it.
 | 403 | You aren't the renter |
 | 404 | `Booking not found: 999` |
 
+### 8.3 `POST /webhooks/payments` 🔏 signature-authenticated
+
+Where a payment actually resolves. The pay endpoint only creates intents; **this is the only
+thing that sets a payment to `SUCCEEDED` or `FAILED`**, writes the ledger, and moves a booking to
+`CONFIRMED` or `PAYMENT_FAILED`.
+
+| Param | In | Notes |
+|-------|----|-------|
+| body | raw | The gateway's JSON, byte-for-byte |
+| `Stripe-Signature` | header | `t={unix},v1={hex hmac}` |
+
+**No JWT.** Stripe has no account here — the signature *is* the authentication, and a stronger
+one than a bearer token. `permitAll` on this route means "authenticated by other means", not "open":
+an unsigned request is still rejected.
+
+**The body is a raw `String`, not a DTO.** The signature is computed over the exact bytes sent.
+Binding to an object would mean verifying a re-serialised copy — different key order, different
+whitespace, different bytes — and every signature would fail.
+
+**200 OK**
+```json
+{ "result": "PROCESSED" }
+```
+| `result` | Meaning |
+|----------|---------|
+| `PROCESSED` | First delivery of an event we act on. State changed. |
+| `DUPLICATE` | Already handled this event id. Nothing happened, and nothing should have. |
+| `IGNORED` | Correctly signed, but not a type we act on (`charge.updated` and friends). |
+
+### Status codes here are instructions, not decoration
+
+A 2xx tells the gateway to stop redelivering; a 5xx tells it to retry for up to three days.
+So the codes are chosen for what they make the gateway *do*:
+
+| Code | Cause | Why |
+|------|-------|-----|
+| 200 | Processed, duplicate, or ignored | All three need no retry |
+| 400 | Bad/missing signature, stale timestamp, unparseable body | Stops redelivery of a payload that will never become valid |
+| 404 | No payment matches the gateway ref | Usually an event from another environment sharing the same test account. Day 18's reconciliation is the safety net if it was ours |
+| 500 | Anything genuinely transient | Retried, which is what we want |
+
+The 400 message is deliberately vague (`Webhook could not be verified`). Telling a prober whether
+they got the signature or the timestamp wrong hands them half the answer; the detail goes to our logs.
+
+### Duplicate delivery is a no-op
+
+Every gateway delivers at-least-once, so "we got this event twice" is not an edge case — it's
+Tuesday. The handler **claims the event id before it acts**, using
+`INSERT ... ON CONFLICT DO NOTHING`. The insert *is* the check: a check-then-insert would be the
+same check-then-act race the booking engine exists to avoid, and two simultaneous copies would
+both write ledger entries.
+
+The claim and the work share **one transaction**:
+
+- Both commit → the event is recorded as done, and it is done.
+- Anything throws → the claim rolls back too, so the gateway's retry gets a genuine second
+  chance rather than being turned away by a marker for work that never happened.
+
+### Replay protection
+
+The timestamp is *inside* the signed payload, so it can't be edited without breaking the
+signature. A ±300s tolerance (`WEBHOOK_TOLERANCE_SECONDS`) then bounds how long a captured
+request stays usable — checked in **both** directions, since only rejecting old timestamps
+leaves a request replayable forever by anyone whose clock runs fast.
+
+The comparison is constant-time. A normal `equals` returns faster the earlier it finds a mismatched
+byte, which leaks enough to forge a signature one byte at a time.
+
+> The `fake` gateway signs and verifies **identically**, with its own secret. A fake that waved
+> signatures through would leave the one security-critical path in this feature untested — on a
+> public endpoint where a hole lets anyone confirm their own bookings for free.
+
+### What a success actually does
+
+1. Payment → `SUCCEEDED`.
+2. A balanced ledger movement is posted (see [§9 `LedgerEntry`](#ledgerentry)).
+3. The booking is confirmed **only once every charge has cleared** — confirming on the fee alone
+   would hand over an item whose damage deposit was never taken.
+
+A failure sets `FAILED` with the decline code, moves the booking to `PAYMENT_FAILED`, and writes
+**no** ledger entries — no money moved. The ledger records what happened, not what was attempted.
+`PAYMENT_FAILED` isn't in the blocking set, so the dates are released with no extra step.
+
 ---
 
 ## 9. Data models
@@ -778,6 +862,57 @@ a unit test asserts they match.
 > "no answer means no charge" is how real systems end up charging a customer whose booking they
 > also cancelled. Only the gateway gets to say `SUCCEEDED` or `FAILED`.
 
+### `LedgerEntry`
+Not exposed by any endpoint today — documented because it's the record that makes the money
+claims checkable.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | Long | |
+| `bookingId` | Long | |
+| `paymentId` | Long | Null for settlement movements with no gateway payment behind them |
+| `account` | `LedgerAccount` | |
+| `debit` | BigDecimal | Exactly one of debit/credit is non-zero — enforced by a DB CHECK |
+| `credit` | BigDecimal | |
+| `createdAt` | Instant | |
+
+**Append-only.** No setters, no `updatedAt`, no `version`, and deliberately *not* `Auditable`
+like every other entity — an accounting record you can edit is not an accounting record. A
+mistake is corrected by posting a new balancing pair, never by rewriting history.
+
+### `LedgerAccount`
+| Account | Meaning |
+|---------|---------|
+| `RENTER_CASH` | Money in from the renter |
+| `OWNER_PAYABLE` | What we owe the item's owner — earned fees, plus any damage claim |
+| `DEPOSIT_HELD` | The refundable hold. Ours to sit on, not ours to keep |
+| `RENTER_REFUND` | Money going back out to the renter |
+
+> The `OWNER_PAYABLE` / `DEPOSIT_HELD` split is the point of the whole design. Both are cash
+> sitting with us; only one is ever ours to pay out. Collapse them into a single "cash held"
+> column and the only question that matters on return — *how much of this do we give back?* —
+> becomes unanswerable.
+
+**Worked example** (from [docs/README.md](docs/README.md) §11), and what
+`PaymentWebhookIT` actually asserts:
+
+```
+==================== LEDGER (booking 156) ====================
+ RENTER_CASH    debit  2000.00  credit     0.00     fee paid
+ OWNER_PAYABLE  debit     0.00  credit  2000.00
+ RENTER_CASH    debit  5000.00  credit     0.00     deposit held
+ DEPOSIT_HELD   debit     0.00  credit  5000.00
+ total debit : 7000.00
+ total credit: 7000.00
+ balanced    : true
+============================================================
+```
+
+Nothing unbalanced is ever written: `LedgerService.post()` validates before it saves, so an
+unbalanced ledger isn't a bug you find later — it's a transaction that never committed. It also
+uses `MANDATORY` propagation, so a ledger entry can never commit while the payment update that
+caused it rolls back.
+
 ### `ApiError`
 | Field | Type | Notes |
 |-------|------|-------|
@@ -791,12 +926,14 @@ a unit test asserts they match.
 `users` ([V1__users.sql](src/main/resources/db/migration/V1__users.sql)),
 `items` ([V2__items.sql](src/main/resources/db/migration/V2__items.sql)),
 `bookings` ([V3__bookings_and_exclusion.sql](src/main/resources/db/migration/V3__bookings_and_exclusion.sql)),
-and `payments` + `ledger_entries`
-([V4__payments_ledger.sql](src/main/resources/db/migration/V4__payments_ledger.sql)).
+`payments` + `ledger_entries`
+([V4__payments_ledger.sql](src/main/resources/db/migration/V4__payments_ledger.sql)),
+and `processed_webhooks` + `returns`
+([V5__returns_webhooks.sql](src/main/resources/db/migration/V5__returns_webhooks.sql)).
 
-`ledger_entries` has no entity yet — the table is created now so the double-entry ledger (Day 14)
-lands as a service on an existing schema. It is append-only by design: no `updated_at`, no
-`version`, and a DB-level check that every row is either a debit or a credit but never both.
+`returns` has no entity yet — created now so Day 18's settlement service lands on an existing
+schema. `processed_webhooks` uses the gateway's event id as its **primary key**, not a surrogate
+id with an index: uniqueness of that value is the entire feature.
 
 All the rest inherit `created_at` / `updated_at` from
 [Auditable](src/main/java/com/rentflow/common/audit/Auditable.java); those columns exist in the DB
@@ -816,6 +953,8 @@ but are **not** exposed in any response DTO today.
 | 403 | Ownership violation, or booking your own item |
 | 404 | Unknown item id |
 | 409 | Duplicate email, dates already booked, or an illegal status transition |
+| 400 | A webhook whose signature, timestamp or body doesn't verify |
+| 404 | A webhook naming a payment we don't have |
 | 502 | The payment gateway rejected us or never answered |
 | 503 | `/actuator/health` when a dependency is DOWN |
 
@@ -922,13 +1061,13 @@ don't expect them to respond:
 - The only booking transitions wired to an endpoint are *create* (→ `PENDING_PAYMENT`) and
   *cancel* (→ `CANCELLED`). `BookingStateMachine` knows the rest, but nothing calls them yet —
   `ACTIVE`/`RETURNED`/`CLOSED` need the return flow.
-- **Nothing sets a payment to `SUCCEEDED` yet.** `POST /bookings/{id}/pay` creates intents and
-  stops there; the webhook that resolves them is Day 13, so today every payment stays `PENDING`
-  and no booking ever reaches `CONFIRMED` on its own.
 - No scheduled job moves `CONFIRMED → ACTIVE` when a start date arrives, and none expires a
   stale `PENDING_PAYMENT`, so an abandoned booking holds its dates until someone cancels it.
-- `POST /webhooks/payments` (signature verify + `processed_webhooks` dedupe), the double-entry
-  ledger service, refunds and settlement
+- **No reconciliation yet.** If a webhook never arrives, the payment sits `PENDING` forever —
+  the sweep that polls the gateway and fixes it is Day 18.
+- Refunds and settlement: `POST /bookings/{id}/return`, deposit release, partial refunds. Nothing
+  creates a `REFUND` payment, and the ledger deliberately has no entries for one.
+- Nothing prunes `processed_webhooks`, so it grows for as long as the app runs.
 - The default gateway is `fake` — it takes no money. Set `PAYMENT_GATEWAY=stripe` with a
   `STRIPE_API_KEY` for the real test-mode API.
 - GraphQL admin analytics, WebSocket payment-status push

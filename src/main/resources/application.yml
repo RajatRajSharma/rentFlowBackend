@@ -72,10 +72,23 @@ app:
   payment:
     gateway: ${PAYMENT_GATEWAY:fake}
     currency: ${PAYMENT_CURRENCY:INR}
+
+    # How far a webhook's signed timestamp may be from now, in either direction. The
+    # timestamp is inside the signed payload, so it can't be edited without breaking the
+    # signature — this window is what stops a captured request being replayed forever.
+    # Stripe's own default is 300s; too tight and clock skew starts rejecting real events.
+    webhook-tolerance-seconds: ${WEBHOOK_TOLERANCE_SECONDS:300}
+
     stripe:
       base-url: ${STRIPE_BASE_URL:https://api.stripe.com}
       api-key: ${STRIPE_API_KEY:}
       webhook-secret: ${STRIPE_WEBHOOK_SECRET:}
+
+    fake:
+      # The fake gateway signs and verifies webhooks exactly as Stripe does, so the
+      # verification path is exercised locally rather than skipped. A dev-only default is
+      # fine precisely because this gateway moves no money.
+      webhook-secret: ${FAKE_WEBHOOK_SECRET:dev-local-webhook-secret-change-me}
 
 # --- Actuator: expose health + info endpoints ---
 management:

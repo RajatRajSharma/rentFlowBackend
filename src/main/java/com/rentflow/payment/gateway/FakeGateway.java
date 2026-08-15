@@ -2,10 +2,13 @@ package com.rentflow.payment.gateway;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HexFormat;
 
 /**
@@ -26,6 +29,15 @@ public class FakeGateway implements PaymentGateway {
 
     private static final Logger log = LoggerFactory.getLogger(FakeGateway.class);
 
+    private final String webhookSecret;
+    private final Duration webhookTolerance;
+
+    public FakeGateway(@Value("${app.payment.fake.webhook-secret}") String webhookSecret,
+                       @Value("${app.payment.webhook-tolerance-seconds:300}") long toleranceSeconds) {
+        this.webhookSecret = webhookSecret;
+        this.webhookTolerance = Duration.ofSeconds(toleranceSeconds);
+    }
+
     @Override
     public GatewayIntent createIntent(GatewayIntentRequest request) {
         String ref = "pi_fake_" + fingerprint(request.idempotencyKey());
@@ -35,9 +47,29 @@ public class FakeGateway implements PaymentGateway {
         return new GatewayIntent(ref, ref + "_secret_" + fingerprint(ref));
     }
 
+    /**
+     * Verified exactly the way Stripe's are, with the fake's own secret.
+     *
+     * A fake that waved signatures through would leave the one security-critical path in
+     * this feature untested — and this endpoint is public, so a hole here lets anyone
+     * confirm their own bookings for free. Same code, different key.
+     */
+    @Override
+    public WebhookEvent parseWebhook(String rawPayload, String signatureHeader) {
+        return StripeStyleWebhooks.parse(rawPayload, signatureHeader, webhookSecret, webhookTolerance);
+    }
+
     @Override
     public String name() {
         return "fake";
+    }
+
+    /**
+     * Sign a payload the way this gateway expects it. Present so local tooling and tests
+     * can produce genuine deliveries — there is no bypass, only a way to hold the key.
+     */
+    public String signatureHeader(String rawPayload, Instant timestamp) {
+        return StripeStyleWebhooks.signatureHeader(rawPayload, webhookSecret, timestamp);
     }
 
     /**

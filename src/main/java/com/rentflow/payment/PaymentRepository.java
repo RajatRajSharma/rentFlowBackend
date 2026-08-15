@@ -21,8 +21,13 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
      * Takes the full set of derived keys (fee + deposit) rather than a prefix match:
      * a LIKE 'b7:abc:%' would also match a key of "b7:abc-extra:FEE", which is a subtle
      * way to hand one caller another caller's payments.
+     *
+     * Ordered by id, and that is not cosmetic. Without it the database may return the rows
+     * in any order, so a replay could hand back the deposit before the fee while the first
+     * call listed them the other way — two different answers to what is meant to be the
+     * same request. Insertion order is fee then deposit, so id order restores it.
      */
-    List<Payment> findByIdempotencyKeyIn(List<String> idempotencyKeys);
+    List<Payment> findByIdempotencyKeyInOrderByIdAsc(List<String> idempotencyKeys);
 
     /** Everything charged for a booking, oldest first. */
     List<Payment> findByBookingIdOrderByIdAsc(Long bookingId);

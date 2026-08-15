@@ -40,6 +40,11 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         // Public endpoints
                         .requestMatchers("/auth/**", "/actuator/**", "/api/version").permitAll()
+                        // Gateway callbacks: there is no user and no token to present. The
+                        // HMAC signature on the payload is the authentication, verified in
+                        // WebhookService — so "permitAll" here means "authenticated by other
+                        // means", not "open". An unsigned request still gets rejected.
+                        .requestMatchers(HttpMethod.POST, "/webhooks/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/items", "/items/*", "/items/*/availability").permitAll()
                         // Everything else needs authentication
                         .anyRequest().authenticated())

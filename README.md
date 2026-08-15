@@ -9,7 +9,7 @@ An equipment-rental marketplace backend. Java · Spring Boot · PostgreSQL.
 | | |
 |---|---|
 | **Runs at** | `http://localhost:8080` |
-| **Status** | Weeks 1–2 done, Week 3 in progress. **500 concurrent requests for one slot produce exactly 1 booking** ([proof](#31-the-concurrency-proof)), and **100 concurrent pay requests produce exactly 1 set of charges** ([proof](#32-the-idempotency-proof)). Webhooks + ledger next. |
+| **Status** | Weeks 1–2 done, Week 3 nearly. **500 concurrent requests for one slot → exactly 1 booking** ([proof](#31-the-concurrency-proof)); **100 concurrent pay requests → exactly 1 set of charges** ([proof](#32-the-idempotency-proof)); **every payment posts a balanced double-entry movement** ([proof](#33-the-books-balance)). Failure scenarios next. |
 | **API reference** | [docs/API_DOCS.md](docs/API_DOCS.md) |
 | **Request flow diagrams** | [docs/API_FLOW.md](docs/API_FLOW.md) |
 | **Full product/system design** | [docs/README.md](docs/README.md) |
@@ -111,9 +111,12 @@ or a real payment processor integration in production mode. See [docs/README.md]
 | Pay for a booking | `POST /bookings/{id}/pay` — fee + deposit intents, `Idempotency-Key` required |
 | **No double-charging** | Replay check + distributed lock + `UNIQUE` key, proven by a 100-thread test — see below |
 | Gateway abstraction | `PaymentGateway` with a Stripe (test-mode) and a keyless `FakeGateway` impl |
+| Payment webhooks | `POST /webhooks/payments` — HMAC signature verify, replay window, `processed_webhooks` dedupe |
+| **Duplicate delivery = no-op** | `INSERT … ON CONFLICT DO NOTHING` claims the event id *before* the work, in the same transaction |
+| **Double-entry ledger** | Every movement is two balanced halves; nothing unbalanced can be written |
 | Uniform errors | one `ApiError` JSON shape for every failure, including security rejections |
-| Schema migrations | Flyway `V1__users.sql`, `V2__items.sql`, `V3__bookings_and_exclusion.sql`, `V4__payments_ledger.sql` |
-| Tests | 46 unit + 11 integration (real Postgres + Redis), all green |
+| Schema migrations | Flyway `V1__users.sql` … `V5__returns_webhooks.sql` |
+| Tests | 55 unit + 18 integration (real Postgres + Redis), all green |
 
 ### 3.1 The concurrency proof
 
@@ -179,11 +182,53 @@ The ordering matters as much as the layers: payment rows are written **before** 
 called, so the key is claimed in our database before any money can move. Charge-then-write means a
 crash in between takes the customer's money with no record of it.
 
-⏳ **Not built yet** — the payment webhook (nothing sets `SUCCEEDED` yet, so bookings never reach
-`CONFIRMED` on their own), the double-entry ledger, refunds/settlement, the return flow, scheduled
-jobs to expire abandoned `PENDING_PAYMENT` bookings and start `CONFIRMED` ones, async
-notifications, WebSocket live status, GraphQL admin analytics. Roadmap in
-[docs/PLAN.md](docs/PLAN.md).
+### 3.3 The books balance
+
+A `payments` table tells you what you **charged**. It cannot tell you what you **owe** — and after
+a rental, part of that ₹5000 deposit may be the owner's (damage) and part the renter's (refund).
+A single amount column has nowhere to put that. Double-entry does, and it comes with a property no
+single-column design has: correctness is **provable** by summing both sides.
+
+Every payment success posts two balanced halves. `PaymentWebhookIT` asserts this exact output:
+
+```
+==================== LEDGER (booking 156) ====================
+ RENTER_CASH    debit  2000.00  credit     0.00     fee paid
+ OWNER_PAYABLE  debit     0.00  credit  2000.00
+ RENTER_CASH    debit  5000.00  credit     0.00     deposit held
+ DEPOSIT_HELD   debit     0.00  credit  5000.00
+ total debit : 7000.00
+ total credit: 7000.00
+ balanced    : true
+============================================================
+```
+
+The two credits land in **different accounts**, and that's the whole design: both are cash sitting
+with us, but only `OWNER_PAYABLE` is ever ours to pay out. `LedgerService` validates before it
+saves, so an unbalanced ledger is never a bug you find later — it's a transaction that never
+committed.
+
+### 3.4 Duplicate webhooks change nothing
+
+Every gateway delivers at-least-once — Stripe retries for up to three days without a 2xx — so "we
+got this event twice" is not an edge case, it's Tuesday. Without a guard, the second delivery posts
+a second ledger movement and the books silently stop balancing.
+
+The handler **claims the event id before it acts**, with `INSERT … ON CONFLICT DO NOTHING`. The
+insert *is* the check — a check-then-insert would be the same check-then-act race the booking
+engine exists to avoid. The claim and the work share one transaction, so a failure rolls back both
+and the gateway's retry gets a real second chance instead of hitting a marker for work that never
+happened.
+
+Signatures are the real Stripe scheme: HMAC-SHA256 over `{timestamp}.{raw body}`, constant-time
+compare, ±300s replay window checked in both directions. The `FakeGateway` signs and verifies
+**identically** — a fake that waved signatures through would leave the one security-critical path
+here untested, on a public endpoint where a hole lets anyone confirm their own bookings for free.
+
+⏳ **Not built yet** — reconciliation for webhooks that never arrive (a payment sits `PENDING`
+forever today), refunds/settlement and the return flow, scheduled jobs to expire abandoned
+`PENDING_PAYMENT` bookings and start `CONFIRMED` ones, async notifications, WebSocket live status,
+GraphQL admin analytics. Roadmap in [docs/PLAN.md](docs/PLAN.md).
 
 ---
 
@@ -416,13 +461,17 @@ rentFlowBackend/
     │   ├── item/                               ItemController · ItemService · Item · dto/
     │   ├── booking/                            the heart — BookingController · BookingService
     │   │                                       BookingStateMachine · Booking · dto/
-    │   └── payment/                            the money — PaymentService · IdempotencyService
-    │       └── gateway/                        PaymentGateway · StripeGateway · FakeGateway
+    │   ├── payment/                            the money — PaymentService · IdempotencyService
+    │   │   │                                   WebhookService · WebhookController
+    │   │   └── gateway/                        PaymentGateway · StripeGateway · FakeGateway
+    │   │                                       StripeStyleWebhooks (HMAC verify)
+    │   └── ledger/                             LedgerService · LedgerEntry · LedgerAccount
     └── resources/
         ├── application.yml                     config: db · redis · rabbit · jwt · lock · payment
         └── db/migration/                       V1__users.sql · V2__items.sql
                                                 V3__bookings_and_exclusion.sql
                                                 V4__payments_ledger.sql
+                                                V5__returns_webhooks.sql
 ```
 
 ---

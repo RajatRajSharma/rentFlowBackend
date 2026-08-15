@@ -14,6 +14,7 @@ import org.springframework.web.client.RestClientException;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
 
 /**
  * Stripe, in test mode, over its REST API.
@@ -34,10 +35,14 @@ public class StripeGateway implements PaymentGateway {
     private static final Logger log = LoggerFactory.getLogger(StripeGateway.class);
 
     private final RestClient client;
+    private final String webhookSecret;
+    private final Duration webhookTolerance;
 
     public StripeGateway(RestClient.Builder builder,
                          @Value("${app.payment.stripe.base-url}") String baseUrl,
-                         @Value("${app.payment.stripe.api-key}") String apiKey) {
+                         @Value("${app.payment.stripe.api-key}") String apiKey,
+                         @Value("${app.payment.stripe.webhook-secret}") String webhookSecret,
+                         @Value("${app.payment.webhook-tolerance-seconds:300}") long toleranceSeconds) {
 
         if (apiKey.isBlank() || apiKey.startsWith("sk_test_xxx")) {
             // Fail at startup, not at the first customer's payment. A placeholder key
@@ -50,6 +55,8 @@ public class StripeGateway implements PaymentGateway {
                 .baseUrl(baseUrl)
                 .defaultHeader("Authorization", "Bearer " + apiKey)
                 .build();
+        this.webhookSecret = webhookSecret;
+        this.webhookTolerance = Duration.ofSeconds(toleranceSeconds);
     }
 
     @Override
@@ -88,6 +95,11 @@ public class StripeGateway implements PaymentGateway {
             log.warn("Stripe intent creation failed for key {}", request.idempotencyKey(), ex);
             throw new PaymentGatewayException("Payment gateway did not accept the request", ex);
         }
+    }
+
+    @Override
+    public WebhookEvent parseWebhook(String rawPayload, String signatureHeader) {
+        return StripeStyleWebhooks.parse(rawPayload, signatureHeader, webhookSecret, webhookTolerance);
     }
 
     @Override

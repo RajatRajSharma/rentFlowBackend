@@ -226,7 +226,7 @@ public class PaymentService {
     // ------------------------------------------------------------------------ helpers
 
     private Optional<List<Payment>> replay(List<String> keys) {
-        List<Payment> existing = paymentRepository.findByIdempotencyKeyIn(keys);
+        List<Payment> existing = paymentRepository.findByIdempotencyKeyInOrderByIdAsc(keys);
         return existing.isEmpty() ? Optional.empty() : Optional.of(existing);
     }
 

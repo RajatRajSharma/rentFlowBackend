@@ -608,6 +608,80 @@ simultaneous pay requests with one key:
 
 ---
 
+## 6h. POST /webhooks/payments — where a payment actually resolves
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GW as Gateway
+    participant WC as WebhookController
+    participant WS as WebhookService
+    participant PG as PaymentGateway
+    participant PW as ProcessedWebhookRepository
+    participant PR as PaymentRepository
+    participant LS as LedgerService
+    participant BR as BookingRepository
+
+    GW->>WC: POST /webhooks/payments + Stripe-Signature
+    Note over WC: body bound as a RAW String —<br/>the signature covers the exact bytes,<br/>so a re-serialised DTO could never verify
+    WC->>WS: handle(rawPayload, signature)
+    Note over WS: @Transactional — the claim and the<br/>work commit or roll back together
+
+    WS->>PG: parseWebhook(payload, signature)
+    Note over PG: HMAC-SHA256 over "{t}.{body}"<br/>constant-time compare<br/>±300s replay window
+    alt signature bad / stale / unparseable
+        PG-->>GW: 400 — stops redelivery of a payload<br/>that will never become valid
+    else verified
+        alt event type we don't act on
+            WS-->>GW: 200 IGNORED (not even recorded)
+        else actionable
+            WS->>PW: INSERT event_id ON CONFLICT DO NOTHING
+            alt 0 rows — seen before
+                WS-->>GW: 200 DUPLICATE, nothing happens
+            else 1 row — first delivery
+                WS->>PR: findByGatewayRef(pi_xxx)
+                alt no such payment
+                    PR-->>GW: 404 (event from another environment)
+                else found
+                    alt succeeded
+                        WS->>PR: markSucceeded + flush
+                        WS->>LS: post(debit RENTER_CASH, credit OWNER_PAYABLE / DEPOSIT_HELD)
+                        Note over LS: validates debits == credits BEFORE saving,<br/>MANDATORY propagation so it can't commit<br/>while the payment update rolls back
+                        WS->>BR: findByIdForUpdate(bookingId)
+                        Note over BR: SELECT FOR UPDATE — fee and deposit<br/>events can arrive simultaneously
+                        alt every charge cleared
+                            WS->>BR: status = CONFIRMED
+                        else still waiting on one
+                            Note over WS: not confirmed — handing over an item<br/>whose deposit never cleared is the bug
+                        end
+                    else failed
+                        WS->>PR: markFailed(reason)
+                        Note over LS: no ledger entry — no money moved.<br/>The ledger records what HAPPENED.
+                        WS->>BR: status = PAYMENT_FAILED
+                        Note over BR: not in BLOCKING, so the dates<br/>are released with no extra step
+                    end
+                    WS-->>GW: 200 PROCESSED
+                end
+            end
+        end
+    end
+```
+
+**The status code is an instruction.** A 2xx tells the gateway to stop redelivering; a 5xx tells it
+to retry for days. So duplicates and ignored types answer 200, a bad signature answers 400, an
+unknown payment answers 404 — and only genuinely transient failures fall through to a 500 and get
+retried.
+
+**Claim before you act, in one transaction.** If the work throws, the claim rolls back with it, so
+the retry gets a real second chance rather than being turned away by a marker for work that never
+happened. Claiming in a separate transaction produces the opposite bug: an event recorded as
+processed that wasn't.
+
+Proven by [PaymentWebhookIT](src/test/java/com/rentflow/payment/PaymentWebhookIT.java) — a
+redelivered event posts no second movement, and the books balance at 7000 = 7000.
+
+---
+
 ## 7. Error path
 
 ```mermaid

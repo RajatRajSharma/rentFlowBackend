@@ -32,6 +32,22 @@ public interface PaymentGateway {
      */
     GatewayIntent createIntent(GatewayIntentRequest request);
 
+    /**
+     * Verify an incoming webhook and translate it into our vocabulary.
+     *
+     * On the gateway rather than in a service because the wire format — the signature
+     * scheme, the event names, where the payment id hides in the envelope — is entirely
+     * the provider's business. {@code WebhookService} should never need to know that
+     * Stripe says {@code payment_intent.payment_failed}.
+     *
+     * @param rawPayload the body EXACTLY as received. Signatures are computed over the raw
+     *        bytes, so anything that re-serialises the JSON first will fail to verify.
+     * @throws WebhookSignatureException if this did not come from our gateway, or is too
+     *         old to accept. Never return a "not verified" flag — a caller can forget to
+     *         check that; an exception cannot be ignored by accident.
+     */
+    WebhookEvent parseWebhook(String rawPayload, String signatureHeader);
+
     /** Which provider this is, for logs and the {@code /api/version}-style diagnostics. */
     String name();
 }

@@ -54,10 +54,7 @@ class BookingConcurrencyIT extends IntegrationTestBase {
 
     @BeforeEach
     void seed() {
-        bookingRepository.deleteAll();
-        itemRepository.deleteAll();
-        userRepository.deleteAll();
-
+        // No cleanup here — IntegrationTestBase truncates every table before each test.
         User owner = userRepository.save(new User("Owner", "owner@test.com", "x", Role.USER));
         User renter = userRepository.save(new User("Renter", "renter@test.com", "x", Role.USER));
         Item item = itemRepository.save(new Item(

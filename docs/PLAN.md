@@ -15,7 +15,7 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 |------|-------|--------|
 | 1 | Foundations — setup, auth, item CRUD | ✅ done |
 | 2 | Booking engine — concurrency (the heart) | ✅ done |
-| 3 | Payments — correctness (the fintech story) | 🚧 Days 11–12 done |
+| 3 | Payments — correctness (the fintech story) | 🚧 Days 11–14 done |
 | 4 | Async & realtime — off-thread + live updates | ⏳ |
 | 5 | Analytics, docs & production | ⏳ |
 
@@ -149,16 +149,44 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 - ✅ All tests green: 46 unit + 11 integration
 
 ### Day 13 — Webhook handler
-- ⏳ `V5__returns_webhooks.sql` (returns + processed_webhooks tables)
-- ⏳ `WebhookController` `POST /webhooks/payments` — signature verify
-- ⏳ Idempotent via `processed_webhooks` (duplicate delivery = no-op)
-- ⏳ On success → booking `CONFIRMED`; on fail → `PAYMENT_FAILED`, item released
+- ✅ `V5__returns_webhooks.sql` (processed_webhooks + returns). `returns` has no entity yet —
+  Day 18's settlement lands on an existing schema
+- ✅ `WebhookController` `POST /webhooks/payments` — public route, because the HMAC signature
+  **is** the authentication. Body bound as a raw `String`: signatures cover the exact bytes
+  sent, so anything that re-serialises the JSON first can never verify
+- ✅ Real Stripe signature scheme in `StripeStyleWebhooks` — HMAC-SHA256 over `{t}.{body}`,
+  constant-time compare, and a ±300s tolerance window against replay. **The `FakeGateway`
+  signs and verifies identically**, so the security-critical path is exercised locally
+  instead of skipped
+- ✅ Idempotent via `processed_webhooks`: `INSERT ... ON CONFLICT DO NOTHING` **is** the
+  check — a check-then-insert would be the same race the booking engine exists to avoid.
+  The claim and the work share one transaction, so a failure rolls back both and the
+  gateway's retry gets a real second chance
+- ✅ On success → booking `CONFIRMED`; on fail → `PAYMENT_FAILED`, dates released
+- ✅ Confirmation waits for **every** charge to clear — confirming on the fee alone would
+  hand over an item whose damage deposit was never taken
+- ✅ `BookingRepository.findByIdForUpdate` — fee and deposit events can arrive together, so
+  the booking row is locked rather than left to optimistic-lock failures
+- ✅ Status codes chosen as instructions to the gateway: 400 bad signature and 404 unknown
+  payment both stop redelivery; duplicates and ignored types answer 200; only genuinely
+  transient failures reach a 5xx and get retried
 
 ### Day 14 — Double-entry ledger
-- ⏳ `LedgerService` — post balanced debit/credit pairs
-- ⏳ Write ledger entries on payment success
-- ⏳ Test: sum(debit) == sum(credit) per booking (books balance)
-- ⏳ Worked example (fee + deposit) verified
+- ✅ `LedgerEntry` (append-only — no setters, no `updatedAt`, no `@Version`, and deliberately
+  **not** `Auditable`) + `LedgerAccount` + `LedgerRepository` + `LedgerBalance`
+- ✅ `LedgerService.post()` — validates before saving, so an unbalanced ledger isn't a bug
+  found later but a transaction that never committed. `MANDATORY` propagation: a ledger
+  entry must never commit while its cause rolls back
+- ✅ Write ledger entries on payment success — `FEE` → RENTER_CASH/OWNER_PAYABLE,
+  `DEPOSIT` → RENTER_CASH/DEPOSIT_HELD. Failures write nothing: the ledger records what
+  happened, not what was attempted
+- ✅ Test: sum(debit) == sum(credit) per booking, using `compareTo` not `equals` so
+  `2000.00` and `2000.000` don't read as a false imbalance
+- ✅ Worked example verified — **₹2000 fee + ₹5000 deposit → 4 entries, 7000 debit =
+  7000 credit**, with the two credits in *different* accounts (only OWNER_PAYABLE is ours
+  to pay out)
+- ✅ A test asserts `LedgerAccount` and the V4 `CHECK` constraint can't drift apart
+- ✅ All tests green: 55 unit + 18 integration
 
 ### Day 15 — Failure scenarios + WireMock
 - ⏳ Card declined → clean rollback

@@ -1,6 +1,7 @@
 package com.rentflow.common.exception;
 
 import com.rentflow.payment.gateway.PaymentGatewayException;
+import com.rentflow.payment.gateway.WebhookSignatureException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -122,6 +123,35 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> handleOptimisticLock(ObjectOptimisticLockingFailureException ex) {
         return build(HttpStatus.CONFLICT,
                 "That record was modified by someone else — reload it and try again", null);
+    }
+
+    /**
+     * A webhook that isn't genuinely from our gateway -> 400.
+     *
+     * The status is an instruction, not decoration: on a 4xx the gateway stops redelivering,
+     * which is right for a payload that will never become valid. A 401/403 would be the wrong
+     * story (this is not a user being denied) and a 5xx would have it retry for days.
+     *
+     * The message stays vague on purpose. "Signature mismatch" versus "timestamp too old"
+     * tells someone probing the endpoint exactly which half of the scheme they got wrong;
+     * the detail goes to our logs instead.
+     */
+    @ExceptionHandler(WebhookSignatureException.class)
+    public ResponseEntity<ApiError> handleWebhookSignature(WebhookSignatureException ex) {
+        log.warn("Rejected webhook: {}", ex.getMessage());
+        return build(HttpStatus.BAD_REQUEST, "Webhook could not be verified", null);
+    }
+
+    /**
+     * Our own accounting produced an unbalanced movement -> 500, and the transaction rolls
+     * back. Never the caller's fault and never fixed by retrying: it means our code is wrong.
+     * Logged at error because a quietly-swallowed version of this is how books stop balancing
+     * without anyone noticing.
+     */
+    @ExceptionHandler(UnbalancedLedgerException.class)
+    public ResponseEntity<ApiError> handleUnbalancedLedger(UnbalancedLedgerException ex) {
+        log.error("LEDGER WOULD NOT BALANCE — transaction rolled back", ex);
+        return build(HttpStatus.INTERNAL_SERVER_ERROR, "Something went wrong on our side", null);
     }
 
     /**
