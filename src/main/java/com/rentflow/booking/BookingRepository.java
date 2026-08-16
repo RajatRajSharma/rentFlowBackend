@@ -42,6 +42,9 @@ public interface BookingRepository extends JpaRepository<Booking, Long> {
     /** A renter's own bookings, newest trip first. Backs GET /bookings/me. */
     List<Booking> findByRenterIdOrderByStartDateDesc(Long renterId);
 
+    /** Bookings whose rental period has begun. Backs the activation worker. */
+    List<Booking> findByStatusAndStartDateLessThanEqual(BookingStatus status, LocalDate date);
+
     /**
      * Load a booking with {@code SELECT ... FOR UPDATE}, so concurrent writers queue in the
      * database rather than racing.

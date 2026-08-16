@@ -13,8 +13,8 @@ public record BookingConfirmed(
         Instant occurredAt
 ) implements DomainEvent {
 
-    public BookingConfirmed(Long bookingId, Long itemId, Long renterId) {
-        this(bookingId, itemId, renterId, Instant.now());
+    public static BookingConfirmed of(Long bookingId, Long itemId, Long renterId) {
+        return new BookingConfirmed(bookingId, itemId, renterId, Instant.now());
     }
 
     @Override

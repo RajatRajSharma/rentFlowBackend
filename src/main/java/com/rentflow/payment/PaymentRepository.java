@@ -5,6 +5,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -15,17 +16,9 @@ import java.util.Optional;
 public interface PaymentRepository extends JpaRepository<Payment, Long> {
 
     /**
-     * The replay lookup. If a retried pay request already produced rows, these are they,
-     * and we return them instead of charging again.
-     *
-     * Takes the full set of derived keys (fee + deposit) rather than a prefix match:
-     * a LIKE 'b7:abc:%' would also match a key of "b7:abc-extra:FEE", which is a subtle
-     * way to hand one caller another caller's payments.
-     *
-     * Ordered by id, and that is not cosmetic. Without it the database may return the rows
-     * in any order, so a replay could hand back the deposit before the fee while the first
-     * call listed them the other way — two different answers to what is meant to be the
-     * same request. Insertion order is fee then deposit, so id order restores it.
+     * The replay lookup. Takes the full set of derived keys rather than a prefix match,
+     * because LIKE 'b7:abc:%' would also match "b7:abc-extra:FEE" — one caller's payments
+     * handed to another. Ordered by id so a replay lists them exactly as the first call did.
      */
     List<Payment> findByIdempotencyKeyInOrderByIdAsc(List<String> idempotencyKeys);
 
@@ -36,17 +29,21 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
     Optional<Payment> findByGatewayRef(String gatewayRef);
 
     /**
-     * Record the gateway's reference, but only if we don't have one yet.
-     *
-     * A conditional UPDATE rather than saving the entity, and the difference matters under
-     * retries. Concurrent attempts each load their own copy of this row at the same
-     * {@code @Version}, so an entity save would let the first writer through and throw an
-     * optimistic-lock failure at every other thread — for a write that agreed with theirs.
-     * The reference is derived from the idempotency key and so is identical across those
-     * threads, which makes "first one writes, the rest quietly no-op" exactly right.
-     *
-     * The {@code IS NULL} guard is what keeps it a no-op rather than a last-writer-wins
-     * overwrite, so this stays safe to call on every replay.
+     * Payments still PENDING long after they were created — the "webhook never arrived" set
+     * that reconciliation sweeps. The cutoff keeps in-flight payments out of it.
+     */
+    @Query("""
+            SELECT p FROM Payment p
+            WHERE p.status = com.rentflow.payment.PaymentStatus.PENDING
+              AND p.createdAt < :cutoff
+            ORDER BY p.id
+            """)
+    List<Payment> findStalePending(@Param("cutoff") Instant cutoff);
+
+    /**
+     * Record the gateway's reference, but only if we don't have one yet. A conditional UPDATE
+     * rather than an entity save: concurrent retries all write the same derived reference, so
+     * "first one wins, the rest no-op" beats failing them all on the optimistic lock.
      *
      * @return 1 if this call set the reference, 0 if it was already set
      */

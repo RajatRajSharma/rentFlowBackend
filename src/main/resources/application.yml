@@ -50,6 +50,23 @@ app:
     secret: ${JWT_SECRET:dev-local-secret-change-me-0123456789abcdef0123456789abcdef}
     expiration-ms: 86400000   # 24 hours
 
+  # Domain events: `rabbit` (default) or `memory` for a run with no broker.
+  events:
+    publisher: ${EVENTS_PUBLISHER:rabbit}
+
+  # Scheduled workers. `enabled: false` turns all three off (integration tests do this and
+  # invoke them directly). stale-payment-minutes must exceed how long a real payment takes,
+  # or reconciliation would chase intents the customer is still paying.
+  workers:
+    enabled: ${WORKERS_ENABLED:true}
+    initial-delay-ms: 30000
+    activation-interval-ms: 300000
+    reconciliation-interval-ms: 60000
+    deposit-release-interval-ms: 300000
+    stale-payment-minutes: ${STALE_PAYMENT_MINUTES:15}
+    # How long an owner has to claim damage before the deposit is released for good.
+    dispute-window-hours: ${DISPUTE_WINDOW_HOURS:24}
+
   # Redis lock (booking creation). wait-ms: how long to queue before a 409. lease-ms: how
   # long Redis holds it if we never release, so a crashed instance can't lock an item forever.
   lock:

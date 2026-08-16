@@ -2,6 +2,7 @@ package com.rentflow.support;
 
 import com.rentflow.payment.gateway.FakeGateway;
 import com.rentflow.payment.gateway.GatewayIntent;
+import com.rentflow.payment.gateway.GatewayPaymentStatus;
 import com.rentflow.payment.gateway.GatewayIntentRequest;
 import com.rentflow.payment.gateway.PaymentGateway;
 import com.rentflow.payment.gateway.PaymentGatewayException;
@@ -10,6 +11,8 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -20,6 +23,8 @@ public class ControllableGateway implements PaymentGateway {
 
     private final FakeGateway delegate;
     private final AtomicInteger intentCalls = new AtomicInteger();
+    private final AtomicInteger statusCalls = new AtomicInteger();
+    private final Map<String, GatewayPaymentStatus> stagedStatuses = new ConcurrentHashMap<>();
 
     private volatile String intentFailure;   // null = healthy
 
@@ -34,6 +39,12 @@ public class ControllableGateway implements PaymentGateway {
 
     public void healIntents() {
         this.intentFailure = null;
+    }
+
+    public void reset() {
+        healIntents();
+        stagedStatuses.clear();
+        statusCalls.set(0);
     }
 
     public int intentCalls() {
@@ -53,6 +64,21 @@ public class ControllableGateway implements PaymentGateway {
     @Override
     public WebhookEvent parseWebhook(String rawPayload, String signatureHeader) {
         return delegate.parseWebhook(rawPayload, signatureHeader);
+    }
+
+    /** Stage what reconciliation will be told when it asks about this intent. */
+    public void stageStatus(String gatewayRef, GatewayPaymentStatus status) {
+        stagedStatuses.put(gatewayRef, status);
+    }
+
+    @Override
+    public GatewayPaymentStatus fetchStatus(String gatewayRef) {
+        statusCalls.incrementAndGet();
+        return stagedStatuses.getOrDefault(gatewayRef, GatewayPaymentStatus.PENDING);
+    }
+
+    public int statusCalls() {
+        return statusCalls.get();
     }
 
     @Override

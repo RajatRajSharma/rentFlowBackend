@@ -689,7 +689,52 @@ delivery failing halfway leaves the event id free for the retry.
 
 **Events are announced after the commit.** `publish` registers an `afterCommit` callback rather
 than delivering inline, so a rollback never sends "your booking is confirmed" for a booking the
-database didn't keep.
+database didn't keep. From there they go to a RabbitMQ topic exchange, and
+`NotificationConsumer` emails both parties on a broker thread — never on the request path.
+
+---
+
+## 6b. Return, settlement and the sweeps
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant OW as Owner
+    participant RC as ReturnController
+    participant SS as SettlementService
+    participant BR as BookingRepository
+    participant LS as LedgerService
+    participant DW as DepositReleaseWorker
+
+    Note over BR: BookingActivationWorker moved this<br/>booking CONFIRMED → ACTIVE on its start date
+    OW->>RC: POST /bookings/{id}/return {condition, depositDeducted}
+    RC->>SS: recordReturn(bookingId, ownerId, request)
+    SS->>BR: findByIdForUpdate(bookingId)
+    SS->>SS: requireOwner(item.ownerId) — the renter cannot close their own claim
+    alt already returned
+        SS-->>OW: the original record, replayed (booking_id is UNIQUE)
+    else first time
+        SS->>LS: debit DEPOSIT_HELD, credit RENTER_REFUND (+ OWNER_PAYABLE if damaged)
+        alt condition = OK
+            SS->>BR: status = RETURNED
+            Note over DW: after the dispute window,<br/>DepositReleaseWorker closes it
+            DW->>BR: status = CLOSED
+        else condition = DAMAGED
+            SS->>BR: status = DISPUTED
+            Note over DW: never auto-closed —<br/>a claim is a human's to resolve
+        end
+    end
+```
+
+**The deposit split is why the ledger exists.** `DEPOSIT_HELD` is debited in full and credited to
+whoever the money now belongs to. A single amount column could record "5000 deposit"; only two
+sides can record "1500 of it is now the owner's" — and the books still balance afterwards, which
+[SettlementIT](src/test/java/com/rentflow/settlement/SettlementIT.java) asserts.
+
+**Reconciliation is the fourth way a payment can settle.** `ReconciliationWorker` asks the gateway
+about anything PENDING past the cutoff and settles it through the same `PaymentSettlement` the
+webhook uses — one accounting path, not two. It never guesses: "still pending" and "couldn't find
+out" are different answers, and a payment with no gateway reference is escalated, not failed.
 
 ---
 

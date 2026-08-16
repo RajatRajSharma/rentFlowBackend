@@ -16,7 +16,7 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 | 1 | Foundations — setup, auth, item CRUD | ✅ done |
 | 2 | Booking engine — concurrency (the heart) | ✅ done |
 | 3 | Payments — correctness (the fintech story) | ✅ done |
-| 4 | Async & realtime — off-thread + live updates | 🚧 Day 16 done |
+| 4 | Async & realtime — off-thread + live updates | 🚧 Days 16–18 done |
 | 5 | Analytics, docs & production | ⏳ |
 
 ---
@@ -231,14 +231,50 @@ A day-by-day checklist from **setup → production**. Grounded in `README.md` (�
 - ✅ All tests green: 66 unit + 29 integration
 
 ### Day 17 — RabbitMQ + notifications
-- ⏳ `RabbitConfig` (exchanges, queues, bindings) + `RabbitEventPublisher`
-- ⏳ `NotificationConsumer` listens on the queue
-- ⏳ `EmailService` (log/console email to start) — email both parties async
+- ✅ `RabbitConfig` — one topic exchange, a notifications queue bound with `#`, and a
+  dead-letter queue behind it. A message the consumer can never handle would otherwise loop
+  forever and starve everything queued behind it
+- ✅ A topic exchange rather than a direct send, because the publisher must not know who
+  listens — Day 19 binds a second queue to the same events and publishing doesn't change
+- ✅ `RabbitEventPublisher` is now the default (`app.events.publisher=rabbit`);
+  `InMemoryPublisher` stays for broker-less runs. The after-commit rule moved into a shared
+  `AfterCommitPublisher` base so both obey it and neither can forget
+- ✅ **A broker outage cannot fail a committed request.** The publish happens after commit, so
+  throwing there would 500 a request whose work is already durable. It logs `LOST EVENT`
+  instead — and Day 20's outbox is the real fix, because a lost notification should be
+  replayable, not just mourned
+- ✅ JSON on the wire, with trusted packages pinned — readable in the RabbitMQ console, and
+  not a deserialization hole
+- ✅ `NotificationConsumer` + `EmailService` (console). Confirmation emails **both** parties;
+  a failed payment emails nobody
+- ✅ `RabbitNotificationIT` runs the whole async path against the real broker: webhook commits
+  → event published → consumer thread → email. All tests green: 66 unit + 32 integration
 
 ### Day 18 — Scheduled workers
-- ⏳ `settlement/` — `Return` + `POST /bookings/{id}/return` + `SettlementService`
-- ⏳ `DepositReleaseWorker` (`@Scheduled`) — release deposits past return window
-- ⏳ `ReconciliationWorker` (`@Scheduled`) — poll PENDING payments, fix "webhook never arrived"
+- ✅ `settlement/` — `Return` entity on V5's table, `SettlementService`,
+  `POST /bookings/{id}/return`. **Owner-only**: they took the item back, so they say what state
+  it's in; a renter cannot close their own damage claim
+- ✅ The deposit split is the movement the ledger was built for — `DEPOSIT_HELD` debited in
+  full, credited to `RENTER_REFUND` and `OWNER_PAYABLE`. OK → RETURNED, DAMAGED → DISPUTED
+- ✅ Idempotent by replay, not by 409: `returns.booking_id` is UNIQUE, and a retried
+  confirmation returns the original record rather than releasing the deposit twice
+- ✅ **Extracted `PaymentSettlement`** from `WebhookService` first. Reconciliation must settle a
+  payment exactly the way a webhook does, and two copies of that would drift — in accounting
+- ✅ `PaymentGateway.fetchStatus` + `GatewayPaymentStatus`, with WireMock tests for Stripe's
+  vocabulary. PENDING ("not yet") and UNKNOWN ("we couldn't find out") are kept apart because
+  only one of them is ever safe to act on
+- ✅ `ReconciliationWorker` — sweeps payments PENDING past a cutoff, asks the gateway, settles
+  what it confirms. Each payment in its own transaction and re-read inside it, so one bad row
+  can't end the sweep and a webhook landing mid-sweep isn't applied twice
+- ✅ A stale payment with **no gateway ref** is flagged for a human, never failed: the Day 15
+  timeout may have left a real intent behind, and guessing would strand a real charge
+- ✅ `DepositReleaseWorker` — closes bookings whose dispute window passed with no claim.
+  DISPUTED is untouched, however long it sits
+- ✅ `BookingActivationWorker` — CONFIRMED → ACTIVE on the start date. Not in the original plan,
+  but nothing else moved a booking there, so a return was unreachable
+- ✅ Workers are plain beans; only `@EnableScheduling` sits behind `app.workers.enabled`. Tests
+  invoke a sweep directly rather than waiting for one
+- ✅ All tests green: 68 unit + 47 integration
 
 ### Day 19 — Websocket + Redis pub/sub
 - ⏳ `WebSocketConfig` — STOMP endpoint `/ws`

@@ -156,8 +156,9 @@ public abstract class IntegrationTestBase {
         registry.add("spring.flyway.enabled", () -> true);
         registry.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
 
-        // No RabbitMQ here: nothing consumes queues yet, so the connection stays lazy.
-        registry.add("management.health.rabbit.enabled", () -> false);
+        // Workers off by default: a @Scheduled sweep firing mid-test would rewrite rows the
+        // test is asserting on. The worker tests invoke them directly instead.
+        registry.add("app.workers.enabled", () -> false);
 
         // Hundreds of threads queue on one lock in the concurrency test. A production-sized
         // 3s wait would make most of them time out — correct behaviour, but it would hide the

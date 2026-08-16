@@ -18,6 +18,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.test.context.TestPropertySource;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -27,9 +28,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Day 16: paying for a booking announces what happened, and a failure announces nothing.
- * Day 17 hangs RabbitMQ and the notification emails off these same events.
+ * Pinned to the in-memory publisher — what's under test is what gets published, not the broker.
  */
 @DisplayName("Domain events")
+@TestPropertySource(properties = "app.events.publisher=memory")
 class EventPublishingIT extends IntegrationTestBase {
 
     private static final BigDecimal DAILY_RATE = new BigDecimal("1000.00");

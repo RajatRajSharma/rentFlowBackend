@@ -22,6 +22,8 @@ validation rules, and error cases. Generated from the code as of **Week 2 comple
 6. [Item endpoints](#6-item-endpoints)
 7. [Booking endpoints](#7-booking-endpoints)
 8. [Payment endpoints](#8-payment-endpoints)
+8b. [Return & settlement](#8b-return--settlement)
+8c. [Background workers](#8c-background-workers)
 9. [Data models](#9-data-models)
 10. [Status code reference](#10-status-code-reference)
 11. [Quick cURL walkthrough](#11-quick-curl-walkthrough)
@@ -50,6 +52,7 @@ validation rules, and error cases. Generated from the code as of **Week 2 comple
 | 15 | POST | `/bookings/{id}/pay` | **Bearer + renter** | Create the payment intents (fee + deposit) |
 | 16 | GET | `/bookings/{id}/payments` | **Bearer + renter** | What has been charged for this booking |
 | 17 | POST | `/webhooks/payments` | **HMAC signature** | Gateway payment callbacks (idempotent) |
+| 18 | POST | `/bookings/{id}/return` | **Bearer + item owner** | Confirm the item is back and split the deposit |
 
 Anything not listed above falls through to `.anyRequest().authenticated()` and returns **401**
 when unauthenticated.
@@ -760,7 +763,66 @@ A failure sets `FAILED` with the decline code, moves the booking to `PAYMENT_FAI
 
 Publishing happens through `EventPublisher`, and delivery is deferred to `afterCommit`. An email
 saying "your booking is confirmed" for a transaction that then rolled back is worse than a late
-email, so a rollback simply never fires it. Day 17 puts RabbitMQ behind the same interface.
+email, so a rollback simply never fires it.
+
+The default publisher puts them on the `rentflow.events` topic exchange, routed by event type
+(`payment.succeeded`, `booking.confirmed`, `return.recorded`), where `NotificationConsumer`
+turns them into email on a broker thread. A queue that keeps rejecting a message dead-letters it
+rather than looping forever. Set `EVENTS_PUBLISHER=memory` to run with no broker at all.
+
+If the broker is down at publish time the event is logged as `LOST EVENT` and the request still
+succeeds — the work is already committed, and failing it would be worse. Day 20's outbox is what
+makes those replayable.
+
+---
+
+## 8b. Return & settlement
+
+### `POST /bookings/{id}/return` 🔒 item owner only
+
+```json
+{ "condition": "DAMAGED", "depositDeducted": 1500.00, "notes": "lens scratched" }
+```
+
+The **owner** confirms, not the renter: they physically took the item back, and a renter must not
+be able to close their own damage claim. The booking must be `ACTIVE`.
+
+There is no `refundAmount` in the request. It is the deposit minus the deduction, computed
+server-side, so an owner cannot name what they hand back. `depositDeducted` must be zero unless
+`condition` is `DAMAGED`, and can never exceed the deposit.
+
+| Outcome | Booking becomes | Ledger |
+|---------|-----------------|--------|
+| `OK` | `RETURNED` | `DEPOSIT_HELD` debit, `RENTER_REFUND` credit — the whole deposit |
+| `DAMAGED` | `DISPUTED` | `DEPOSIT_HELD` debit, split between `OWNER_PAYABLE` and `RENTER_REFUND` |
+
+This is the movement double-entry exists for: a single amount column can record "5000 deposit",
+but only two sides can record "1500 of it is now the owner's".
+
+A repeat call **replays** rather than conflicts — `returns.booking_id` is UNIQUE, and the second
+confirmation returns the first one's record instead of releasing the deposit twice.
+
+---
+
+## 8c. Background workers
+
+Three `@Scheduled` sweeps handle the things no request will ever trigger. All are off when
+`WORKERS_ENABLED=false`; the workers stay ordinary beans so tests can run one sweep directly.
+
+| Worker | Every | What it does |
+|--------|-------|--------------|
+| `BookingActivationWorker` | 5 min | `CONFIRMED` → `ACTIVE` once the start date arrives, so the item can be returned |
+| `ReconciliationWorker` | 1 min | Asks the gateway about payments `PENDING` past `STALE_PAYMENT_MINUTES` and settles what it confirms |
+| `DepositReleaseWorker` | 5 min | Closes bookings whose `DISPUTE_WINDOW_HOURS` passed with no claim |
+
+**Reconciliation is the "webhook never arrived" net.** Webhooks get lost — a deploy mid-delivery,
+an outage, a firewall — and without it the renter is charged while the booking sits
+`PENDING_PAYMENT` forever, holding dates nobody can use. It settles through the same
+`PaymentSettlement` the webhook uses, so there is one accounting path, not two.
+
+It never guesses. `PENDING` ("not yet") and `UNKNOWN` ("we couldn't find out") are distinct
+answers and neither is acted on, and a stale payment with **no gateway reference** is logged for
+a human rather than failed — the intent may exist even though we lost the reference to it.
 
 ---
 
@@ -803,6 +865,17 @@ email, so a rollback simply never fires it. Day 17 puts RabbitMQ behind the same
 | `status` | enum | see the state machine below |
 | `totalAmount` | BigDecimal | `dailyRate × days`, snapshot |
 | `depositAmount` | BigDecimal | copied from the item, snapshot |
+
+### `ReturnResponse`
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | Long | |
+| `bookingId` | Long | UNIQUE — an item is returned once |
+| `condition` | enum | `OK` \| `DAMAGED` |
+| `depositDeducted` | BigDecimal | the owner's damage claim; zero unless `DAMAGED` |
+| `refundAmount` | BigDecimal | deposit − deduction, computed server-side |
+| `notes` | String | the owner's evidence for a claim |
+| `bookingStatus` | enum | `RETURNED`, or `DISPUTED` when damage was claimed |
 
 ### `AvailabilityResponse`
 | Field | Type | Notes |
@@ -1066,15 +1139,12 @@ Planned in [README.md](docs/README.md) §6 / [PLAN.md](docs/PLAN.md) but **not**
 don't expect them to respond:
 
 - `DELETE /items/{id}`, `GET /items/mine`, filtering/pagination on `GET /items`
-- The only booking transitions wired to an endpoint are *create* (→ `PENDING_PAYMENT`) and
-  *cancel* (→ `CANCELLED`). `BookingStateMachine` knows the rest, but nothing calls them yet —
-  `ACTIVE`/`RETURNED`/`CLOSED` need the return flow.
-- No scheduled job moves `CONFIRMED → ACTIVE` when a start date arrives, and none expires a
-  stale `PENDING_PAYMENT`, so an abandoned booking holds its dates until someone cancels it.
-- **No reconciliation yet.** If a webhook never arrives, the payment sits `PENDING` forever —
-  the sweep that polls the gateway and fixes it is Day 18.
-- Refunds and settlement: `POST /bookings/{id}/return`, deposit release, partial refunds. Nothing
-  creates a `REFUND` payment, and the ledger deliberately has no entries for one.
+- Nothing expires a stale `PENDING_PAYMENT`, so an abandoned booking holds its dates until
+  someone cancels it or reconciliation hears the payment failed.
+- `DISPUTED → CLOSED` has no endpoint: raising a claim is wired up, resolving one is still a
+  manual database change.
+- No money actually leaves. Settlement records what the renter is owed in `RENTER_REFUND`;
+  nothing creates a `REFUND` payment or calls the gateway to pay it out.
 - Nothing prunes `processed_webhooks`, so it grows for as long as the app runs.
 - The default gateway is `fake` — it takes no money. Set `PAYMENT_GATEWAY=stripe` with a
   `STRIPE_API_KEY` for the real test-mode API.

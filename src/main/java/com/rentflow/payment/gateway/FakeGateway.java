@@ -12,16 +12,11 @@ import java.time.Instant;
 import java.util.HexFormat;
 
 /**
- * A gateway that takes no money and needs no keys — the default, so a fresh clone runs
- * end to end with an empty {@code .env}.
+ * A gateway that takes no money and needs no keys — the default, so a fresh clone runs end to
+ * end with an empty {@code .env}. Swapped out with {@code app.payment.gateway=stripe}.
  *
- * This is not a test double dressed up as production code; it is the honest local
- * implementation of the same contract, and it keeps the one property that matters:
- * <b>the same idempotency key always yields the same reference</b>. That is derived, not
- * remembered, so it survives a restart and behaves identically across instances — which
- * means the idempotency behaviour you exercise locally is the behaviour you get in prod.
- *
- * Swapped out by setting {@code app.payment.gateway=stripe}.
+ * It keeps the property that matters: the same idempotency key always derives the same
+ * reference, so it survives restarts and behaves identically across instances.
  */
 @Component
 @ConditionalOnProperty(name = "app.payment.gateway", havingValue = "fake", matchIfMissing = true)
@@ -48,15 +43,21 @@ public class FakeGateway implements PaymentGateway {
     }
 
     /**
-     * Verified exactly the way Stripe's are, with the fake's own secret.
-     *
-     * A fake that waved signatures through would leave the one security-critical path in
-     * this feature untested — and this endpoint is public, so a hole here lets anyone
-     * confirm their own bookings for free. Same code, different key.
+     * Verified exactly the way Stripe's are, with the fake's own secret — a fake that waved
+     * signatures through would leave a public endpoint's only defence untested.
      */
     @Override
     public WebhookEvent parseWebhook(String rawPayload, String signatureHeader) {
         return StripeStyleWebhooks.parse(rawPayload, signatureHeader, webhookSecret, webhookTolerance);
+    }
+
+    /**
+     * Always PENDING: this gateway keeps no state, so it has nothing to report. Reconciliation
+     * therefore never settles anything locally, which is the honest answer rather than a lie.
+     */
+    @Override
+    public GatewayPaymentStatus fetchStatus(String gatewayRef) {
+        return GatewayPaymentStatus.PENDING;
     }
 
     @Override
@@ -65,17 +66,16 @@ public class FakeGateway implements PaymentGateway {
     }
 
     /**
-     * Sign a payload the way this gateway expects it. Present so local tooling and tests
-     * can produce genuine deliveries — there is no bypass, only a way to hold the key.
+     * Sign a payload the way this gateway expects. Local tooling and tests produce genuine
+     * deliveries with it — there is no bypass, only a way to hold the key.
      */
     public String signatureHeader(String rawPayload, Instant timestamp) {
         return StripeStyleWebhooks.signatureHeader(rawPayload, webhookSecret, timestamp);
     }
 
     /**
-     * A short, stable, opaque id for a key. Hex of the string's hash rather than the key
-     * itself, so a reference handed to a client never leaks the key that produced it —
-     * the same reason you don't put a raw idempotency key in a URL.
+     * A short, stable, opaque id for a key — hashed, so a reference handed to a client never
+     * leaks the key that produced it.
      */
     private static String fingerprint(String key) {
         byte[] bytes = key.getBytes(StandardCharsets.UTF_8);

@@ -2,9 +2,8 @@ package com.rentflow.event;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -12,11 +11,12 @@ import java.util.Deque;
 import java.util.List;
 
 /**
- * The starting implementation: log it, keep it, move on. Day 17 swaps in RabbitMQ behind
- * the same interface.
+ * Log it, keep it, move on — for runs with no broker. Selected with
+ * {@code app.events.publisher=memory}; the default is {@link RabbitEventPublisher}.
  */
 @Component
-public class InMemoryPublisher implements EventPublisher {
+@ConditionalOnProperty(name = "app.events.publisher", havingValue = "memory")
+public class InMemoryPublisher extends AfterCommitPublisher {
 
     private static final Logger log = LoggerFactory.getLogger(InMemoryPublisher.class);
 
@@ -25,25 +25,7 @@ public class InMemoryPublisher implements EventPublisher {
 
     private final Deque<DomainEvent> recent = new ArrayDeque<>();
 
-    /**
-     * Held until the caller's transaction commits: an email saying "your booking is
-     * confirmed" for a booking the database never kept is worse than a late one.
-     */
-    @Override
-    public void publish(DomainEvent event) {
-        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            deliver(event);
-            return;
-        }
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                deliver(event);
-            }
-        });
-    }
-
-    /** Events delivered so far, oldest first. Bounded, so a long-running app can't grow here. */
+    /** Events delivered so far, oldest first. Bounded, so a long run can't grow here. */
     public synchronized List<DomainEvent> recent() {
         return new ArrayList<>(recent);
     }
@@ -52,7 +34,8 @@ public class InMemoryPublisher implements EventPublisher {
         recent.clear();
     }
 
-    private synchronized void deliver(DomainEvent event) {
+    @Override
+    protected synchronized void deliver(DomainEvent event) {
         log.info("event {} booking={} at={}", event.type(), event.bookingId(), event.occurredAt());
         recent.addLast(event);
         if (recent.size() > RETAINED) {

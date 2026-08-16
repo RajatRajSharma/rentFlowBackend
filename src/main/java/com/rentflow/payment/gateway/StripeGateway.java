@@ -112,6 +112,39 @@ public class StripeGateway implements PaymentGateway {
         return StripeStyleWebhooks.parse(rawPayload, signatureHeader, webhookSecret, webhookTolerance);
     }
 
+    /**
+     * GET the intent and read its status. Anything we can't reach or don't recognise is
+     * UNKNOWN — guessing here would settle a payment on a network error.
+     */
+    @Override
+    public GatewayPaymentStatus fetchStatus(String gatewayRef) {
+        try {
+            JsonNode intent = parse(client.get()
+                    .uri("/v1/payment_intents/{id}", gatewayRef)
+                    .retrieve()
+                    .body(String.class));
+
+            String status = intent.path("status").asText("");
+            boolean declined = intent.hasNonNull("last_payment_error");
+
+            return switch (status) {
+                case "succeeded" -> GatewayPaymentStatus.SUCCEEDED;
+                case "canceled" -> GatewayPaymentStatus.FAILED;
+                // Stripe puts a declined intent back here, distinguishable only by the error
+                // it left behind. Without one, it's simply an intent nobody has paid yet.
+                case "requires_payment_method" ->
+                        declined ? GatewayPaymentStatus.FAILED : GatewayPaymentStatus.PENDING;
+                case "processing", "requires_action", "requires_confirmation", "requires_capture" ->
+                        GatewayPaymentStatus.PENDING;
+                default -> GatewayPaymentStatus.UNKNOWN;
+            };
+
+        } catch (RestClientException | PaymentGatewayException ex) {
+            log.warn("Could not fetch Stripe status for {}", gatewayRef, ex);
+            return GatewayPaymentStatus.UNKNOWN;
+        }
+    }
+
     @Override
     public String name() {
         return "stripe";

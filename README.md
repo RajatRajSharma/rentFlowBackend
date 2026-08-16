@@ -115,10 +115,13 @@ or a real payment processor integration in production mode. See [docs/README.md]
 | **Duplicate delivery = no-op** | `INSERT … ON CONFLICT DO NOTHING` claims the event id *before* the work, in the same transaction |
 | **Double-entry ledger** | Every movement is two balanced halves; nothing unbalanced can be written |
 | Failure scenarios | Declines, gateway outages and timeouts covered by WireMock tests against the real `StripeGateway` |
-| Domain events | `EventPublisher` + `PaymentSucceeded` / `BookingConfirmed`, delivered only after the transaction commits |
+| Domain events | `EventPublisher` + `PaymentSucceeded` / `BookingConfirmed` / `ReturnRecorded`, delivered only after the transaction commits |
+| Async notifications | RabbitMQ topic exchange → `NotificationConsumer` → email, off the request thread, with a dead-letter queue |
+| Return & settlement | `POST /bookings/{id}/return` — owner-only, splits the deposit into refund and damage claim |
+| Scheduled workers | Activation (CONFIRMED → ACTIVE), deposit release after the dispute window, and reconciliation for "the webhook never arrived" |
 | Uniform errors | one `ApiError` JSON shape for every failure, including security rejections |
 | Schema migrations | Flyway `V1__users.sql` … `V5__returns_webhooks.sql` |
-| Tests | 66 unit + 29 integration (real Postgres + Redis), all green |
+| Tests | 68 unit + 47 integration (real Postgres, Redis + RabbitMQ), all green |
 
 ### 3.1 The concurrency proof
 

@@ -71,7 +71,7 @@ class InMemoryPublisherTest {
     @DisplayName("the retained window is bounded")
     void retainsOnlyTheRecentPast() {
         for (int i = 0; i < 250; i++) {
-            publisher.publish(new BookingConfirmed((long) i, 1L, 2L));
+            publisher.publish(BookingConfirmed.of((long) i, 1L, 2L));
         }
 
         assertThat(publisher.recent()).hasSize(200);
@@ -79,6 +79,6 @@ class InMemoryPublisherTest {
     }
 
     private static PaymentSucceeded paymentSucceeded() {
-        return new PaymentSucceeded(9L, 1L, PaymentType.FEE, new BigDecimal("2000.00"));
+        return PaymentSucceeded.of(9L, 1L, PaymentType.FEE, new BigDecimal("2000.00"));
     }
 }

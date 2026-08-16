@@ -12,6 +12,7 @@ import java.math.BigDecimal;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
@@ -144,7 +145,48 @@ class StripeGatewayWireMockTest {
         assertThatCode(() -> gateway()).doesNotThrowAnyException();
     }
 
+    @Test
+    @DisplayName("reconciliation reads the intent's status, and never guesses")
+    void fetchStatusMapsStripesVocabulary() {
+        assertThat(statusFor("""
+                {"id":"pi_3Nx","status":"succeeded"}""")).isEqualTo(GatewayPaymentStatus.SUCCEEDED);
+
+        assertThat(statusFor("""
+                {"id":"pi_3Nx","status":"canceled"}""")).isEqualTo(GatewayPaymentStatus.FAILED);
+
+        // A declined intent goes back to requires_payment_method — the error is what tells
+        // it apart from an intent nobody has paid yet.
+        assertThat(statusFor("""
+                {"id":"pi_3Nx","status":"requires_payment_method",\
+                "last_payment_error":{"code":"card_declined"}}""")).isEqualTo(GatewayPaymentStatus.FAILED);
+        assertThat(statusFor("""
+                {"id":"pi_3Nx","status":"requires_payment_method"}""")).isEqualTo(GatewayPaymentStatus.PENDING);
+
+        assertThat(statusFor("""
+                {"id":"pi_3Nx","status":"processing"}""")).isEqualTo(GatewayPaymentStatus.PENDING);
+        assertThat(statusFor("""
+                {"id":"pi_3Nx","status":"something_new"}""")).isEqualTo(GatewayPaymentStatus.UNKNOWN);
+    }
+
+    @Test
+    @DisplayName("an unreachable Stripe is UNKNOWN, not a failed payment")
+    void fetchStatusSwallowsGatewayErrors() {
+        stripe.stubFor(get(urlEqualTo(INTENTS + "/pi_3Nx")).willReturn(aResponse().withStatus(500)));
+
+        assertThat(gateway().fetchStatus("pi_3Nx"))
+                .as("settling a payment on a network error is the one unforgivable outcome")
+                .isEqualTo(GatewayPaymentStatus.UNKNOWN);
+    }
+
     // ------------------------------------------------------------------------- helpers
+
+    private GatewayPaymentStatus statusFor(String intentJson) {
+        stripe.stubFor(get(urlEqualTo(INTENTS + "/pi_3Nx")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody(intentJson)));
+        return gateway().fetchStatus("pi_3Nx");
+    }
 
     private void stubOk(String body) {
         stripe.stubFor(post(urlEqualTo(INTENTS)).willReturn(aResponse()

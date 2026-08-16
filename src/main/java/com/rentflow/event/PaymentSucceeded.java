@@ -17,8 +17,9 @@ public record PaymentSucceeded(
         Instant occurredAt
 ) implements DomainEvent {
 
-    public PaymentSucceeded(Long paymentId, Long bookingId, PaymentType paymentType, BigDecimal amount) {
-        this(paymentId, bookingId, paymentType, amount, Instant.now());
+    /** Stamps the time here so callers can't disagree about when it happened. */
+    public static PaymentSucceeded of(Long paymentId, Long bookingId, PaymentType type, BigDecimal amount) {
+        return new PaymentSucceeded(paymentId, bookingId, type, amount, Instant.now());
     }
 
     @Override
